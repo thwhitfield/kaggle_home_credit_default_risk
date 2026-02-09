@@ -108,6 +108,78 @@ def _add_cross_table_features(df: pl.DataFrame) -> pl.DataFrame:
             pl.sum_horizontal(dpd_cols).alias("CROSS_COMBINED_DPD_SCORE")
         )
 
+    # --- EXT_SOURCE × bureau delinquency (credit score penalized by DPD) ---
+    if "EXT_SOURCE_3" in df.columns and "BUR_BB_DPD_RATE_MEAN" in df.columns:
+        exprs.append(
+            (pl.col("EXT_SOURCE_3").fill_null(0) * (1 - pl.col("BUR_BB_DPD_RATE_MEAN").fill_null(0)))
+            .alias("CROSS_EXT3_ADJUSTED_BY_DPD")
+        )
+    if "EXT_SOURCE_2" in df.columns and "BUR_OVERDUE_RATE" in df.columns:
+        exprs.append(
+            (pl.col("EXT_SOURCE_2").fill_null(0) * (1 - pl.col("BUR_OVERDUE_RATE").fill_null(0)))
+            .alias("CROSS_EXT2_ADJUSTED_BY_OVERDUE")
+        )
+
+    # --- Income × active debt load (debt-to-income from bureau) ---
+    if "BUR_ACTIVE_DEBT_TOTAL" in df.columns and "AMT_INCOME_TOTAL" in df.columns:
+        exprs.append(
+            (pl.col("BUR_ACTIVE_DEBT_TOTAL").fill_null(0) / (pl.col("AMT_INCOME_TOTAL") + 1))
+            .alias("CROSS_ACTIVE_DEBT_TO_INCOME")
+        )
+
+    # --- Age × credit card utilization (young + high utilization = risky) ---
+    if "CC_UTILIZATION_MEAN" in df.columns and "DAYS_BIRTH" in df.columns:
+        exprs.append(
+            (pl.col("CC_UTILIZATION_MEAN").fill_null(0) / ((pl.col("DAYS_BIRTH") / -365.25) + 1))
+            .alias("CROSS_CC_UTIL_PER_AGE")
+        )
+
+    # --- Employment stability × payment behavior ---
+    if "INS_LATE_RATE" in df.columns and "DAYS_EMPLOYED" in df.columns:
+        exprs.append(
+            (pl.col("INS_LATE_RATE").fill_null(0) * (pl.col("DAYS_EMPLOYED").fill_null(0) / -365.25).clip(0, 50))
+            .alias("CROSS_LATE_RATE_x_EMPLOYMENT")
+        )
+
+    # --- Total supplementary table null count (thin file indicator) ---
+    supp_null_cols = []
+    for c in ["BUR_COUNT", "PREV_COUNT", "INS_COUNT", "POS_COUNT", "CC_COUNT"]:
+        if c in df.columns:
+            supp_null_cols.append(pl.col(c).is_null().cast(pl.Int8))
+    if supp_null_cols:
+        exprs.append(
+            pl.sum_horizontal(supp_null_cols).alias("CROSS_THIN_FILE_SCORE")
+        )
+
+    # --- Recent behavior risk score (combines recent DPD signals) ---
+    recent_dpd = []
+    if "BUR_BB_RECENT_6M_DPD_RATE_MEAN" in df.columns:
+        recent_dpd.append(pl.col("BUR_BB_RECENT_6M_DPD_RATE_MEAN").fill_null(0))
+    if "POS_RECENT_6M_DPD_RATE" in df.columns:
+        recent_dpd.append(pl.col("POS_RECENT_6M_DPD_RATE").fill_null(0))
+    if "INS_RECENT_12_LATE_RATE" in df.columns:
+        recent_dpd.append(pl.col("INS_RECENT_12_LATE_RATE").fill_null(0))
+    if "CC_RECENT_12M_DPD_COUNT" in df.columns:
+        recent_dpd.append((pl.col("CC_RECENT_12M_DPD_COUNT").fill_null(0) / 12.0))
+    if len(recent_dpd) >= 2:
+        exprs.append(
+            pl.sum_horizontal(recent_dpd).alias("CROSS_RECENT_DPD_SCORE")
+        )
+
+    # --- Credit utilization trend (worsening across products) ---
+    if "CC_UTIL_TREND_12M" in df.columns and "INS_RECENT_12_PAYMENT_RATIO" in df.columns:
+        exprs.append(
+            (pl.col("CC_UTIL_TREND_12M").fill_null(0) - pl.col("INS_RECENT_12_PAYMENT_RATIO").fill_null(1) + 1)
+            .alias("CROSS_WORSENING_BEHAVIOR_SCORE")
+        )
+
+    # --- Previous app count × EXT_SOURCE (experienced + good score = low risk) ---
+    if "PREV_COUNT" in df.columns and "APP_EXT_SOURCE_MEAN" in df.columns:
+        exprs.append(
+            (pl.col("PREV_COUNT").fill_null(0).log1p() * pl.col("APP_EXT_SOURCE_MEAN").fill_null(0))
+            .alias("CROSS_EXPERIENCE_x_SCORE")
+        )
+
     if exprs:
         df = df.with_columns(exprs)
 

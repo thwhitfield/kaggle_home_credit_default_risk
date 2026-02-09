@@ -351,6 +351,113 @@ def train_lightgbm_cv(
     }
 
 
+def train_catboost_cv(
+    train_df: pl.DataFrame,
+    params: dict | None = None,
+    n_folds: int = 5,
+    feature_cols: list[str] | None = None,
+    experiment_name: str = "catboost",
+) -> dict:
+    """Train CatBoost with stratified K-fold CV for blending."""
+    from catboost import CatBoostClassifier
+
+    if params is None:
+        params = {
+            "iterations": 2000,
+            "learning_rate": 0.03,
+            "depth": 6,
+            "l2_leaf_reg": 3.0,
+            "subsample": 0.8,
+            "colsample_bylevel": 0.7,
+            "min_data_in_leaf": 30,
+            "random_seed": 42,
+            "eval_metric": "AUC",
+            "auto_class_weights": "Balanced",
+            "verbose": 0,
+        }
+
+    if feature_cols is None:
+        feature_cols = get_feature_columns(train_df)
+
+    X, y, numeric_cols = prepare_data(train_df, feature_cols)
+
+    te_cols_present = [c for c in TARGET_ENCODE_COLS if c in train_df.columns]
+    te_col_names = [f"TE_{c}" for c in te_cols_present]
+    all_feature_names = numeric_cols + te_col_names
+
+    log.info(f"CatBoost training: {X.shape[0]:,} samples, {len(all_feature_names)} features")
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    cv_scores = []
+    models = []
+    importances = np.zeros(len(all_feature_names))
+    oof_preds = np.full(X.shape[0], np.nan)
+
+    early_stopping_rounds = params.pop("early_stopping_rounds", 100)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_train_base, X_val_base = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        if te_cols_present:
+            fold_train_df = train_df[train_idx]
+            fold_val_df = train_df[val_idx]
+
+            te_train_arrays = []
+            te_val_arrays = []
+            for col in te_cols_present:
+                te_tr, te_va = _target_encode_fold(fold_train_df, fold_val_df, col)
+                te_train_arrays.append(te_tr.reshape(-1, 1))
+                te_val_arrays.append(te_va.reshape(-1, 1))
+
+            X_train = np.hstack([X_train_base] + te_train_arrays)
+            X_val = np.hstack([X_val_base] + te_val_arrays)
+        else:
+            X_train, X_val = X_train_base, X_val_base
+
+        model = CatBoostClassifier(**params)
+        model.fit(
+            X_train, y_train,
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=early_stopping_rounds,
+            verbose=0,
+        )
+
+        val_preds = model.predict_proba(X_val)[:, 1]
+        fold_auc = roc_auc_score(y_val, val_preds)
+        cv_scores.append(fold_auc)
+        oof_preds[val_idx] = val_preds
+
+        importances += model.feature_importances_ / n_folds
+        models.append(model)
+
+        log.info(f"  Fold {fold + 1}/{n_folds}: AUC = {fold_auc:.5f} "
+                 f"(best iter: {model.best_iteration_})")
+
+    params["early_stopping_rounds"] = early_stopping_rounds
+
+    mean_auc = np.mean(cv_scores)
+    std_auc = np.std(cv_scores)
+    log.info(f"CatBoost CV AUC: {mean_auc:.5f} +/- {std_auc:.5f}")
+
+    _log_experiment(experiment_name, params, mean_auc, std_auc, len(all_feature_names), cv_scores)
+
+    return {
+        "cv_scores": cv_scores,
+        "mean_auc": mean_auc,
+        "std_auc": std_auc,
+        "models": models,
+        "feature_importances": importances,
+        "feature_names": all_feature_names,
+        "numeric_cols": numeric_cols,
+        "te_cols": te_cols_present,
+        "oof_preds": oof_preds,
+        "params": params,
+        "model_type": "catboost",
+    }
+
+
 def find_blend_weight(oof_xgb: np.ndarray, oof_lgb: np.ndarray, y: np.ndarray) -> float:
     """Find optimal XGBoost weight for blending (XGB weight + LGB weight = 1)."""
     best_auc = 0.0
@@ -362,6 +469,30 @@ def find_blend_weight(oof_xgb: np.ndarray, oof_lgb: np.ndarray, y: np.ndarray) -
             best_auc = auc
             best_w = w
     log.info(f"Best blend: XGB={best_w:.2f}, LGB={1-best_w:.2f}, AUC={best_auc:.5f}")
+    return best_w
+
+
+def find_blend_weights_3(
+    oof_xgb: np.ndarray,
+    oof_lgb: np.ndarray,
+    oof_cb: np.ndarray,
+    y: np.ndarray,
+    step: float = 0.02,
+) -> tuple[float, float, float]:
+    """Find optimal weights for 3-model blend (XGB, LGB, CatBoost)."""
+    best_auc = 0.0
+    best_w = (0.34, 0.33, 0.33)
+    for w_xgb in np.arange(0.2, 0.71, step):
+        for w_lgb in np.arange(0.1, 0.71 - w_xgb, step):
+            w_cb = 1.0 - w_xgb - w_lgb
+            if w_cb < 0.05:
+                continue
+            blended = w_xgb * oof_xgb + w_lgb * oof_lgb + w_cb * oof_cb
+            auc = roc_auc_score(y, blended)
+            if auc > best_auc:
+                best_auc = auc
+                best_w = (w_xgb, w_lgb, w_cb)
+    log.info(f"Best 3-way blend: XGB={best_w[0]:.2f}, LGB={best_w[1]:.2f}, CB={best_w[2]:.2f}, AUC={best_auc:.5f}")
     return best_w
 
 
