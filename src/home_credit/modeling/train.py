@@ -496,6 +496,36 @@ def find_blend_weights_3(
     return best_w
 
 
+def find_blend_weights_4(
+    oof_a: np.ndarray,
+    oof_b: np.ndarray,
+    oof_c: np.ndarray,
+    oof_d: np.ndarray,
+    y: np.ndarray,
+    step: float = 0.04,
+    labels: tuple[str, str, str, str] = ("A", "B", "C", "D"),
+) -> tuple[float, float, float, float]:
+    """Find optimal weights for 4-model blend via grid search."""
+    best_auc = 0.0
+    best_w = (0.25, 0.25, 0.25, 0.25)
+    for w_a in np.arange(0.1, 0.61, step):
+        for w_b in np.arange(0.05, 0.61 - w_a, step):
+            for w_c in np.arange(0.05, 0.61 - w_a - w_b, step):
+                w_d = 1.0 - w_a - w_b - w_c
+                if w_d < 0.05:
+                    continue
+                blended = w_a * oof_a + w_b * oof_b + w_c * oof_c + w_d * oof_d
+                auc = roc_auc_score(y, blended)
+                if auc > best_auc:
+                    best_auc = auc
+                    best_w = (w_a, w_b, w_c, w_d)
+    log.info(
+        f"Best 4-way blend: {labels[0]}={best_w[0]:.2f}, {labels[1]}={best_w[1]:.2f}, "
+        f"{labels[2]}={best_w[2]:.2f}, {labels[3]}={best_w[3]:.2f}, AUC={best_auc:.5f}"
+    )
+    return best_w
+
+
 def _log_experiment(
     name: str,
     params: dict,

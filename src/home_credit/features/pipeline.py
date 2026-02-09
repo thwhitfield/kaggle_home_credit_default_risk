@@ -8,6 +8,7 @@ from home_credit.data.loader import load_table
 from home_credit.features.application import build_application_features
 from home_credit.features.bureau import build_bureau_features
 from home_credit.features.credit_card import build_credit_card_features
+from home_credit.features.experimental import build_winning_experimental_features
 from home_credit.features.installments import build_installment_features
 from home_credit.features.pos_cash import build_pos_cash_features
 from home_credit.features.previous import build_previous_application_features
@@ -241,8 +242,19 @@ def build_all_features(
         cc=load_table("credit_card_balance", data_dir),
     )
 
+    # --- Experimental features (H2: trajectory, H3: time-since, H4: untapped, H5: per-type) ---
+    exp_feats = _build_and_save(
+        "experimental_v4", build_winning_experimental_features, features_dir,
+        installments=load_table("installments_payments", data_dir),
+        cc=load_table("credit_card_balance", data_dir),
+        pos=load_table("POS_CASH_balance", data_dir),
+        bureau=load_table("bureau", data_dir),
+        bureau_balance=load_table("bureau_balance", data_dir),
+        prev=load_table("previous_application", data_dir),
+    )
+
     # --- Join all supplementary features onto application ---
-    supp_tables = [bureau_feats, prev_feats, installment_feats, pos_feats, cc_feats]
+    supp_tables = [bureau_feats, prev_feats, installment_feats, pos_feats, cc_feats, exp_feats]
 
     def join_all(app_df: pl.DataFrame) -> pl.DataFrame:
         result = app_df
