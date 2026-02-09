@@ -38,5 +38,8 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# CatBoost
+catboost_info/
+
 # uv
 uv.lock
