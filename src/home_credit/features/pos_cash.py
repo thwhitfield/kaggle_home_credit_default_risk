@@ -7,7 +7,7 @@ from home_credit.utils import get_logger
 log = get_logger(__name__)
 
 
-def build_pos_cash_features(pos: pl.LazyFrame) -> pl.LazyFrame:
+def build_pos_cash_features(pos: pl.DataFrame) -> pl.DataFrame:
     """Aggregate POS/cash balance features to SK_ID_CURR level.
 
     POS_CASH tracks monthly snapshots of point-of-sale and cash loans.
@@ -15,6 +15,7 @@ def build_pos_cash_features(pos: pl.LazyFrame) -> pl.LazyFrame:
     """
     log.info("Building POS/cash features")
 
+    # --- Main aggregation ---
     feats = pos.group_by("SK_ID_CURR").agg(
         # --- Volume ---
         pl.len().alias("POS_COUNT"),
@@ -40,6 +41,24 @@ def build_pos_cash_features(pos: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("MONTHS_BALANCE").min().alias("POS_MONTHS_BALANCE_MIN"),
     )
 
+    # --- Recent POS behavior (last 6 months) ---
+    recent_6m = pos.filter(pl.col("MONTHS_BALANCE") >= -6).group_by("SK_ID_CURR").agg(
+        pl.col("SK_DPD").max().alias("POS_RECENT_6M_DPD_MAX"),
+        pl.col("SK_DPD").mean().alias("POS_RECENT_6M_DPD_MEAN"),
+        (pl.col("SK_DPD") > 0).sum().alias("POS_RECENT_6M_DPD_COUNT"),
+        (pl.col("NAME_CONTRACT_STATUS") == "Active").sum().alias("POS_RECENT_6M_ACTIVE"),
+    )
+
+    # --- Recent POS behavior (last 12 months) ---
+    recent_12m = pos.filter(pl.col("MONTHS_BALANCE") >= -12).group_by("SK_ID_CURR").agg(
+        pl.col("SK_DPD").max().alias("POS_RECENT_12M_DPD_MAX"),
+        (pl.col("SK_DPD") > 0).sum().alias("POS_RECENT_12M_DPD_COUNT"),
+        (pl.col("SK_DPD_DEF") > 0).sum().alias("POS_RECENT_12M_DPD_DEF_COUNT"),
+    )
+
+    feats = feats.join(recent_6m, on="SK_ID_CURR", how="left")
+    feats = feats.join(recent_12m, on="SK_ID_CURR", how="left")
+
     # Derived
     feats = feats.with_columns(
         # DPD rate across all POS months
@@ -51,6 +70,9 @@ def build_pos_cash_features(pos: pl.LazyFrame) -> pl.LazyFrame:
         # Average months per loan
         (pl.col("POS_COUNT") / (pl.col("POS_NUM_LOANS") + 1))
         .alias("POS_AVG_MONTHS_PER_LOAN"),
+        # Recent DPD rate
+        (pl.col("POS_RECENT_6M_DPD_COUNT").fill_null(0) / 6.0)
+        .alias("POS_RECENT_6M_DPD_RATE"),
     )
 
     return feats

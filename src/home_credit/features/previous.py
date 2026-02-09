@@ -7,10 +7,11 @@ from home_credit.utils import get_logger
 log = get_logger(__name__)
 
 
-def build_previous_application_features(prev: pl.LazyFrame) -> pl.LazyFrame:
+def build_previous_application_features(prev: pl.DataFrame) -> pl.DataFrame:
     """Aggregate previous Home Credit applications to SK_ID_CURR level."""
     log.info("Building previous application features")
 
+    # --- Main aggregation: all previous applications ---
     feats = prev.group_by("SK_ID_CURR").agg(
         # --- Counts by status ---
         pl.len().alias("PREV_COUNT"),
@@ -57,7 +58,42 @@ def build_previous_application_features(prev: pl.LazyFrame) -> pl.LazyFrame:
         .alias("PREV_SUNDAY_APP_COUNT"),
         # Insurance
         (pl.col("NFLAG_INSURED_ON_APPROVAL") == 1).sum().alias("PREV_INSURED_COUNT"),
+        # Payment term (number of installments)
+        pl.col("CNT_PAYMENT").mean().alias("PREV_PAYMENT_TERM_MEAN"),
+        pl.col("CNT_PAYMENT").max().alias("PREV_PAYMENT_TERM_MAX"),
     )
+
+    # --- Approved applications only (became actual loans) ---
+    approved_feats = prev.filter(
+        pl.col("NAME_CONTRACT_STATUS") == "Approved"
+    ).group_by("SK_ID_CURR").agg(
+        pl.col("AMT_CREDIT").mean().alias("PREV_APPROVED_CREDIT_MEAN"),
+        pl.col("AMT_CREDIT").max().alias("PREV_APPROVED_CREDIT_MAX"),
+        pl.col("AMT_ANNUITY").mean().alias("PREV_APPROVED_ANNUITY_MEAN"),
+        pl.col("DAYS_DECISION").max().alias("PREV_LAST_APPROVED_DAYS"),
+        pl.col("AMT_DOWN_PAYMENT").mean().alias("PREV_APPROVED_DOWN_PAYMENT_MEAN"),
+    )
+
+    # --- Refused applications ---
+    refused_feats = prev.filter(
+        pl.col("NAME_CONTRACT_STATUS") == "Refused"
+    ).group_by("SK_ID_CURR").agg(
+        pl.col("AMT_APPLICATION").mean().alias("PREV_REFUSED_AMT_MEAN"),
+        pl.col("DAYS_DECISION").max().alias("PREV_LAST_REFUSED_DAYS"),
+    )
+
+    # --- Recent applications (last 1 year) ---
+    recent_1y = prev.filter(
+        pl.col("DAYS_DECISION") > -365
+    ).group_by("SK_ID_CURR").agg(
+        pl.len().alias("PREV_RECENT_1Y_COUNT"),
+        (pl.col("NAME_CONTRACT_STATUS") == "Approved").sum().alias("PREV_RECENT_1Y_APPROVED"),
+        (pl.col("NAME_CONTRACT_STATUS") == "Refused").sum().alias("PREV_RECENT_1Y_REFUSED"),
+    )
+
+    feats = feats.join(approved_feats, on="SK_ID_CURR", how="left")
+    feats = feats.join(refused_feats, on="SK_ID_CURR", how="left")
+    feats = feats.join(recent_1y, on="SK_ID_CURR", how="left")
 
     # Derived ratios
     feats = feats.with_columns(
@@ -73,6 +109,10 @@ def build_previous_application_features(prev: pl.LazyFrame) -> pl.LazyFrame:
         # How recently they applied (history span)
         (pl.col("PREV_MOST_RECENT_DECISION") - pl.col("PREV_OLDEST_DECISION"))
         .alias("PREV_HISTORY_SPAN"),
+        # Recent approval rate
+        (pl.col("PREV_RECENT_1Y_APPROVED").fill_null(0)
+         / (pl.col("PREV_RECENT_1Y_COUNT").fill_null(0) + 1))
+        .alias("PREV_RECENT_1Y_APPROVAL_RATE"),
     )
 
     return feats

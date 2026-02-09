@@ -12,7 +12,7 @@ import numpy as np
 import polars as pl
 
 from home_credit.features.pipeline import build_all_features, get_feature_columns
-from home_credit.modeling.train import load_model, prepare_data
+from home_credit.modeling.train import load_model, prepare_data, _target_encode_full, TARGET_ENCODE_COLS
 from home_credit.utils import OUTPUT_DIR, get_logger
 
 log = get_logger(__name__)
@@ -24,6 +24,7 @@ def generate_submission(
     test_df: pl.DataFrame,
     model_data: dict,
     save_path: Path | None = None,
+    train_df: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Generate submission DataFrame from test data and trained models."""
     if save_path is None:
@@ -33,15 +34,30 @@ def generate_submission(
     feature_names = model_data["feature_names"]
     models = model_data["models"]
 
-    # Prepare test features (only numeric columns the model was trained on)
-    available = [c for c in feature_names if c in test_df.columns]
-    missing = [c for c in feature_names if c not in test_df.columns]
-    if missing:
-        log.warning(f"Missing {len(missing)} features in test data, filling with 0")
-        for c in missing:
+    # Separate numeric and target-encoded feature names
+    te_cols = model_data.get("te_cols", [])
+    numeric_cols = model_data.get("numeric_cols", [c for c in feature_names if not c.startswith("TE_")])
+
+    # Prepare numeric test features
+    for c in numeric_cols:
+        if c not in test_df.columns:
             test_df = test_df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(c))
 
-    X_test = test_df.select(feature_names).to_numpy().astype(np.float32)
+    X_test = test_df.select(numeric_cols).to_numpy().astype(np.float32)
+
+    # Add target-encoded features if model uses them
+    if te_cols and train_df is not None:
+        te_arrays = []
+        for col in te_cols:
+            if col in train_df.columns and col in test_df.columns:
+                _, te_test = _target_encode_full(train_df, test_df, col)
+                te_arrays.append(te_test.reshape(-1, 1))
+        if te_arrays:
+            X_test = np.hstack([X_test] + te_arrays)
+    elif te_cols:
+        log.warning("Model uses target encoding but no train_df provided, filling TE features with 0")
+        te_zeros = np.zeros((X_test.shape[0], len(te_cols)), dtype=np.float32)
+        X_test = np.hstack([X_test, te_zeros])
 
     # Average predictions across CV folds
     preds = np.zeros(X_test.shape[0])
@@ -234,10 +250,10 @@ def main():
     log.info(f"Loaded model: {args.model} (CV AUC: {model_data['mean_auc']:.5f})")
 
     # Build features (will use cache)
-    _, test_df = build_all_features()
+    train_df, test_df = build_all_features()
 
-    # Generate submission
-    submission = generate_submission(test_df, model_data)
+    # Generate submission (pass train_df for target encoding)
+    submission = generate_submission(test_df, model_data, train_df=train_df)
 
     # Log
     log_submission(

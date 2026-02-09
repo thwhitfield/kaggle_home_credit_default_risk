@@ -7,7 +7,7 @@ from home_credit.utils import get_logger
 log = get_logger(__name__)
 
 
-def build_installment_features(installments: pl.LazyFrame) -> pl.LazyFrame:
+def build_installment_features(installments: pl.DataFrame) -> pl.DataFrame:
     """Aggregate installment payment behavior to SK_ID_CURR level.
 
     Key insight: late payments and underpayments are strong default signals.
@@ -24,6 +24,7 @@ def build_installment_features(installments: pl.LazyFrame) -> pl.LazyFrame:
         (pl.col("AMT_INSTALMENT") - pl.col("AMT_PAYMENT")).alias("INS_UNDERPAYMENT"),
     )
 
+    # --- Main aggregation: all installments ---
     feats = enriched.group_by("SK_ID_CURR").agg(
         # --- Volume ---
         pl.len().alias("INS_COUNT"),
@@ -57,6 +58,21 @@ def build_installment_features(installments: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("NUM_INSTALMENT_VERSION").n_unique().alias("INS_VERSION_VARIETY"),
     )
 
+    # --- Recent installment behavior (last 12 installments by due date) ---
+    recent_feats = enriched.sort("DAYS_INSTALMENT", descending=True).group_by("SK_ID_CURR").agg(
+        pl.col("INS_DAYS_DIFF").head(12).mean().alias("INS_RECENT_12_DAYS_DIFF_MEAN"),
+        pl.col("INS_DAYS_DIFF").head(12).std().alias("INS_RECENT_12_DAYS_DIFF_STD"),
+        (pl.col("INS_DAYS_DIFF").head(12) > 0).sum().alias("INS_RECENT_12_LATE_COUNT"),
+        (pl.col("INS_DAYS_DIFF").head(12) > 30).sum().alias("INS_RECENT_12_LATE_30_COUNT"),
+        pl.col("INS_PAYMENT_RATIO").head(12).mean().alias("INS_RECENT_12_PAYMENT_RATIO"),
+        pl.col("INS_PAYMENT_RATIO").head(12).min().alias("INS_RECENT_12_PAYMENT_RATIO_MIN"),
+        # Last installment details
+        pl.col("INS_DAYS_DIFF").head(1).first().alias("INS_LAST_DAYS_DIFF"),
+        pl.col("INS_PAYMENT_RATIO").head(1).first().alias("INS_LAST_PAYMENT_RATIO"),
+    )
+
+    feats = feats.join(recent_feats, on="SK_ID_CURR", how="left")
+
     # Derived
     feats = feats.with_columns(
         # Late payment rate
@@ -68,6 +84,9 @@ def build_installment_features(installments: pl.LazyFrame) -> pl.LazyFrame:
         # Average installments per loan
         (pl.col("INS_COUNT") / (pl.col("INS_NUM_PREV_LOANS") + 1))
         .alias("INS_AVG_PER_LOAN"),
+        # Recent late rate (last 12)
+        (pl.col("INS_RECENT_12_LATE_COUNT") / 12.0)
+        .alias("INS_RECENT_12_LATE_RATE"),
     )
 
     return feats

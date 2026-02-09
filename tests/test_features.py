@@ -20,21 +20,21 @@ def check_features_exist():
 
 class TestApplicationFeatures:
     def test_builds_without_error(self, check_data_exists):
-        from home_credit.data.loader import scan_table
+        from home_credit.data.loader import load_table
         from home_credit.features.application import build_application_features
 
-        lf = scan_table("application_train")
-        result = build_application_features(lf).collect()
+        df = load_table("application_train")
+        result = build_application_features(df)
         assert result.shape[0] > 0
         assert "APP_CREDIT_TO_INCOME_RATIO" in result.columns
         assert "APP_AGE_YEARS" in result.columns
         assert "APP_EXT_SOURCE_MEAN" in result.columns
 
     def test_no_all_null_columns(self, check_data_exists):
-        from home_credit.data.loader import scan_table
+        from home_credit.data.loader import load_table
         from home_credit.features.application import build_application_features
 
-        result = build_application_features(scan_table("application_train")).collect()
+        result = build_application_features(load_table("application_train"))
         new_cols = [c for c in result.columns if c.startswith("APP_")]
         for col in new_cols:
             assert result[col].null_count() < result.shape[0], f"{col} is all null"
@@ -42,25 +42,25 @@ class TestApplicationFeatures:
 
 class TestBureauFeatures:
     def test_builds_without_error(self, check_data_exists):
-        from home_credit.data.loader import scan_table
+        from home_credit.data.loader import load_table
         from home_credit.features.bureau import build_bureau_features
 
         result = build_bureau_features(
-            scan_table("bureau"),
-            scan_table("bureau_balance"),
-        ).collect()
+            load_table("bureau"),
+            load_table("bureau_balance"),
+        )
         assert result.shape[0] > 0
         assert "BUR_COUNT" in result.columns
         assert "BUR_DEBT_TO_CREDIT_RATIO" in result.columns
 
     def test_aggregates_to_sk_id_curr(self, check_data_exists):
-        from home_credit.data.loader import scan_table
+        from home_credit.data.loader import load_table
         from home_credit.features.bureau import build_bureau_features
 
         result = build_bureau_features(
-            scan_table("bureau"),
-            scan_table("bureau_balance"),
-        ).collect()
+            load_table("bureau"),
+            load_table("bureau_balance"),
+        )
         assert result["SK_ID_CURR"].n_unique() == result.shape[0], "Not unique per SK_ID_CURR"
 
 

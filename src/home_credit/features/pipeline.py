@@ -4,7 +4,7 @@ from pathlib import Path
 
 import polars as pl
 
-from home_credit.data.loader import scan_table
+from home_credit.data.loader import load_table
 from home_credit.features.application import build_application_features
 from home_credit.features.bureau import build_bureau_features
 from home_credit.features.credit_card import build_credit_card_features
@@ -24,11 +24,94 @@ def _build_and_save(name: str, builder, features_dir: Path, **kwargs) -> pl.Data
         return pl.read_parquet(parquet_path)
 
     with timer(f"Building {name} features", log):
-        feats_lazy = builder(**kwargs)
-        feats = feats_lazy.collect()
+        feats = builder(**kwargs)
     feats.write_parquet(parquet_path)
     log.info(f"Saved {name} features: {feats.shape[1]} columns, {feats.shape[0]:,} rows")
     return feats
+
+
+def _add_cross_table_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add interaction features that combine signals across tables."""
+    log.info("Adding cross-table interaction features")
+
+    exprs = []
+
+    # --- Bureau debt relative to current application ---
+    if "BUR_DEBT_TOTAL" in df.columns and "AMT_CREDIT" in df.columns:
+        exprs.append(
+            (pl.col("BUR_DEBT_TOTAL").fill_null(0) / (pl.col("AMT_CREDIT") + 1))
+            .alias("CROSS_EXISTING_DEBT_TO_NEW_CREDIT")
+        )
+
+    # --- Total credit exposure relative to income ---
+    if "BUR_AMT_CREDIT_TOTAL" in df.columns and "AMT_INCOME_TOTAL" in df.columns:
+        exprs.append(
+            ((pl.col("BUR_AMT_CREDIT_TOTAL").fill_null(0) + pl.col("AMT_CREDIT"))
+             / (pl.col("AMT_INCOME_TOTAL") + 1))
+            .alias("CROSS_TOTAL_CREDIT_TO_INCOME")
+        )
+
+    # --- Bureau annuity burden combined with current annuity ---
+    if "BUR_ACTIVE_ANNUITY_TOTAL" in df.columns and "AMT_ANNUITY" in df.columns:
+        exprs.append(
+            ((pl.col("BUR_ACTIVE_ANNUITY_TOTAL").fill_null(0)
+              + pl.col("AMT_ANNUITY").fill_null(0))
+             / (pl.col("AMT_INCOME_TOTAL") + 1))
+            .alias("CROSS_TOTAL_ANNUITY_TO_INCOME")
+        )
+
+    # --- Refusal rate crossed with credit amount ---
+    if "PREV_REFUSAL_RATE" in df.columns:
+        exprs.append(
+            (pl.col("PREV_REFUSAL_RATE").fill_null(0) * pl.col("AMT_CREDIT"))
+            .alias("CROSS_REFUSAL_RATE_x_CREDIT")
+        )
+
+    # --- External score crossed with late payment behavior ---
+    if "INS_LATE_RATE" in df.columns and "EXT_SOURCE_2" in df.columns:
+        exprs.append(
+            (pl.col("EXT_SOURCE_2").fill_null(0) * pl.col("INS_LATE_RATE").fill_null(0))
+            .alias("CROSS_EXT2_x_LATE_RATE")
+        )
+
+    # --- Is this a first-time applicant? (no previous applications) ---
+    if "PREV_COUNT" in df.columns:
+        exprs.append(
+            pl.col("PREV_COUNT").is_null().cast(pl.Int8)
+            .alias("CROSS_FIRST_TIME_APPLICANT")
+        )
+    if "BUR_COUNT" in df.columns:
+        exprs.append(
+            pl.col("BUR_COUNT").is_null().cast(pl.Int8)
+            .alias("CROSS_NO_BUREAU_HISTORY")
+        )
+
+    # --- Credit amount vs previous approved amount (escalation risk) ---
+    if "PREV_APPROVED_CREDIT_MEAN" in df.columns:
+        exprs.append(
+            (pl.col("AMT_CREDIT") / (pl.col("PREV_APPROVED_CREDIT_MEAN").fill_null(0) + 1))
+            .alias("CROSS_CREDIT_VS_PREV_APPROVED")
+        )
+
+    # --- Combined DPD risk score (across bureau, POS, CC, installments) ---
+    dpd_cols = []
+    if "BUR_BB_DPD_RATE_MEAN" in df.columns:
+        dpd_cols.append(pl.col("BUR_BB_DPD_RATE_MEAN").fill_null(0))
+    if "POS_DPD_RATE" in df.columns:
+        dpd_cols.append(pl.col("POS_DPD_RATE").fill_null(0))
+    if "CC_DPD_RATE" in df.columns:
+        dpd_cols.append(pl.col("CC_DPD_RATE").fill_null(0))
+    if "INS_LATE_RATE" in df.columns:
+        dpd_cols.append(pl.col("INS_LATE_RATE").fill_null(0))
+    if len(dpd_cols) >= 2:
+        exprs.append(
+            pl.sum_horizontal(dpd_cols).alias("CROSS_COMBINED_DPD_SCORE")
+        )
+
+    if exprs:
+        df = df.with_columns(exprs)
+
+    return df
 
 
 def build_all_features(
@@ -52,38 +135,38 @@ def build_all_features(
     # --- Application features (both train and test) ---
     app_train = _build_and_save(
         "app_train", build_application_features, features_dir,
-        app=scan_table("application_train", data_dir),
+        app=load_table("application_train", data_dir),
     )
     app_test = _build_and_save(
         "app_test", build_application_features, features_dir,
-        app=scan_table("application_test", data_dir),
+        app=load_table("application_test", data_dir),
     )
 
     # --- Supplementary table features (shared between train and test) ---
     bureau_feats = _build_and_save(
         "bureau", build_bureau_features, features_dir,
-        bureau=scan_table("bureau", data_dir),
-        bureau_balance=scan_table("bureau_balance", data_dir),
+        bureau=load_table("bureau", data_dir),
+        bureau_balance=load_table("bureau_balance", data_dir),
     )
 
     prev_feats = _build_and_save(
         "previous", build_previous_application_features, features_dir,
-        prev=scan_table("previous_application", data_dir),
+        prev=load_table("previous_application", data_dir),
     )
 
     installment_feats = _build_and_save(
         "installments", build_installment_features, features_dir,
-        installments=scan_table("installments_payments", data_dir),
+        installments=load_table("installments_payments", data_dir),
     )
 
     pos_feats = _build_and_save(
         "pos_cash", build_pos_cash_features, features_dir,
-        pos=scan_table("POS_CASH_balance", data_dir),
+        pos=load_table("POS_CASH_balance", data_dir),
     )
 
     cc_feats = _build_and_save(
         "credit_card", build_credit_card_features, features_dir,
-        cc=scan_table("credit_card_balance", data_dir),
+        cc=load_table("credit_card_balance", data_dir),
     )
 
     # --- Join all supplementary features onto application ---
@@ -93,6 +176,8 @@ def build_all_features(
         result = app_df
         for feats_df in supp_tables:
             result = result.join(feats_df, on="SK_ID_CURR", how="left")
+        # Add cross-table interaction features
+        result = _add_cross_table_features(result)
         return result
 
     with timer("Joining all features", log):

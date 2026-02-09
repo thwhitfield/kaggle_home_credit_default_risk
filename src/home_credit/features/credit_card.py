@@ -7,7 +7,7 @@ from home_credit.utils import get_logger
 log = get_logger(__name__)
 
 
-def build_credit_card_features(cc: pl.LazyFrame) -> pl.LazyFrame:
+def build_credit_card_features(cc: pl.DataFrame) -> pl.DataFrame:
     """Aggregate credit card balance features to SK_ID_CURR level.
 
     Credit card behavior — utilization, drawing patterns, payment behavior.
@@ -27,6 +27,7 @@ def build_credit_card_features(cc: pl.LazyFrame) -> pl.LazyFrame:
         .alias("CC_DRAWING_RATIO"),
     )
 
+    # --- Main aggregation: all months ---
     feats = enriched.group_by("SK_ID_CURR").agg(
         # --- Volume ---
         pl.len().alias("CC_COUNT"),
@@ -74,6 +75,25 @@ def build_credit_card_features(cc: pl.LazyFrame) -> pl.LazyFrame:
         (pl.col("NAME_CONTRACT_STATUS") == "Active").sum().alias("CC_ACTIVE_MONTHS"),
     )
 
+    # --- Recent credit card behavior (last 3 months) ---
+    recent_3m = enriched.filter(pl.col("MONTHS_BALANCE") >= -3).group_by("SK_ID_CURR").agg(
+        pl.col("CC_UTILIZATION").mean().alias("CC_RECENT_3M_UTIL_MEAN"),
+        pl.col("AMT_BALANCE").mean().alias("CC_RECENT_3M_BALANCE_MEAN"),
+        pl.col("SK_DPD").max().alias("CC_RECENT_3M_DPD_MAX"),
+        pl.col("CC_PAYMENT_TO_MIN_RATIO").mean().alias("CC_RECENT_3M_PAY_MIN_RATIO"),
+    )
+
+    # --- Recent credit card behavior (last 12 months) ---
+    recent_12m = enriched.filter(pl.col("MONTHS_BALANCE") >= -12).group_by("SK_ID_CURR").agg(
+        pl.col("CC_UTILIZATION").mean().alias("CC_RECENT_12M_UTIL_MEAN"),
+        (pl.col("CC_UTILIZATION") > 0.9).sum().alias("CC_RECENT_12M_HIGH_UTIL_MONTHS"),
+        (pl.col("SK_DPD") > 0).sum().alias("CC_RECENT_12M_DPD_COUNT"),
+        pl.col("AMT_DRAWINGS_ATM_CURRENT").sum().alias("CC_RECENT_12M_ATM_TOTAL"),
+    )
+
+    feats = feats.join(recent_3m, on="SK_ID_CURR", how="left")
+    feats = feats.join(recent_12m, on="SK_ID_CURR", how="left")
+
     # Derived
     feats = feats.with_columns(
         # DPD rate
@@ -88,6 +108,11 @@ def build_credit_card_features(cc: pl.LazyFrame) -> pl.LazyFrame:
         # Average months per card
         (pl.col("CC_COUNT") / (pl.col("CC_NUM_CARDS") + 1))
         .alias("CC_AVG_MONTHS_PER_CARD"),
+        # Utilization trend: recent vs overall (positive = worsening)
+        (pl.col("CC_RECENT_3M_UTIL_MEAN").fill_null(0) - pl.col("CC_UTILIZATION_MEAN").fill_null(0))
+        .alias("CC_UTIL_TREND_3M"),
+        (pl.col("CC_RECENT_12M_UTIL_MEAN").fill_null(0) - pl.col("CC_UTILIZATION_MEAN").fill_null(0))
+        .alias("CC_UTIL_TREND_12M"),
     )
 
     return feats
