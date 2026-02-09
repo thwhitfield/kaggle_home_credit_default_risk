@@ -1,0 +1,97 @@
+"""Tests for feature engineering modules."""
+
+import polars as pl
+import pytest
+
+from home_credit.utils import DATA_DIR, FEATURES_DIR
+
+
+@pytest.fixture(scope="module")
+def check_data_exists():
+    if not (DATA_DIR / "application_train.csv").exists():
+        pytest.skip("Data not downloaded")
+
+
+@pytest.fixture(scope="module")
+def check_features_exist():
+    if not (FEATURES_DIR / "train_final.parquet").exists():
+        pytest.skip("Features not built — run `python -m home_credit.features.pipeline` first")
+
+
+class TestApplicationFeatures:
+    def test_builds_without_error(self, check_data_exists):
+        from home_credit.data.loader import scan_table
+        from home_credit.features.application import build_application_features
+
+        lf = scan_table("application_train")
+        result = build_application_features(lf).collect()
+        assert result.shape[0] > 0
+        assert "APP_CREDIT_TO_INCOME_RATIO" in result.columns
+        assert "APP_AGE_YEARS" in result.columns
+        assert "APP_EXT_SOURCE_MEAN" in result.columns
+
+    def test_no_all_null_columns(self, check_data_exists):
+        from home_credit.data.loader import scan_table
+        from home_credit.features.application import build_application_features
+
+        result = build_application_features(scan_table("application_train")).collect()
+        new_cols = [c for c in result.columns if c.startswith("APP_")]
+        for col in new_cols:
+            assert result[col].null_count() < result.shape[0], f"{col} is all null"
+
+
+class TestBureauFeatures:
+    def test_builds_without_error(self, check_data_exists):
+        from home_credit.data.loader import scan_table
+        from home_credit.features.bureau import build_bureau_features
+
+        result = build_bureau_features(
+            scan_table("bureau"),
+            scan_table("bureau_balance"),
+        ).collect()
+        assert result.shape[0] > 0
+        assert "BUR_COUNT" in result.columns
+        assert "BUR_DEBT_TO_CREDIT_RATIO" in result.columns
+
+    def test_aggregates_to_sk_id_curr(self, check_data_exists):
+        from home_credit.data.loader import scan_table
+        from home_credit.features.bureau import build_bureau_features
+
+        result = build_bureau_features(
+            scan_table("bureau"),
+            scan_table("bureau_balance"),
+        ).collect()
+        assert result["SK_ID_CURR"].n_unique() == result.shape[0], "Not unique per SK_ID_CURR"
+
+
+class TestFinalFeatureSet:
+    def test_train_has_target(self, check_features_exist):
+        df = pl.read_parquet(FEATURES_DIR / "train_final.parquet")
+        assert "TARGET" in df.columns
+        assert df["TARGET"].n_unique() == 2
+
+    def test_test_has_no_target(self, check_features_exist):
+        df = pl.read_parquet(FEATURES_DIR / "test_final.parquet")
+        assert "TARGET" not in df.columns
+
+    def test_no_all_null_features(self, check_features_exist):
+        df = pl.read_parquet(FEATURES_DIR / "train_final.parquet")
+        exclude = {"SK_ID_CURR", "TARGET"}
+        feature_cols = [c for c in df.columns if c not in exclude]
+        all_null = [c for c in feature_cols if df[c].null_count() == df.shape[0]]
+        assert len(all_null) == 0, f"All-null features: {all_null}"
+
+    def test_train_test_column_alignment(self, check_features_exist):
+        train = pl.read_parquet(FEATURES_DIR / "train_final.parquet")
+        test = pl.read_parquet(FEATURES_DIR / "test_final.parquet")
+        train_feats = set(train.columns) - {"TARGET"}
+        test_feats = set(test.columns)
+        assert train_feats == test_feats, (
+            f"Mismatch: train-only={train_feats - test_feats}, test-only={test_feats - train_feats}"
+        )
+
+    def test_feature_count_reasonable(self, check_features_exist):
+        df = pl.read_parquet(FEATURES_DIR / "train_final.parquet")
+        n_features = len([c for c in df.columns if c not in {"SK_ID_CURR", "TARGET"}])
+        assert n_features >= 100, f"Only {n_features} features, expected 100+"
+        assert n_features < 1000, f"Too many features ({n_features}), possible duplication"

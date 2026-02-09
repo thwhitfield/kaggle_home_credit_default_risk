@@ -83,11 +83,8 @@ def train_cv(
     importances = np.zeros(X.shape[1])
     oof_preds = np.full(X.shape[0], np.nan)
 
-    # Separate early_stopping_rounds from params for fit()
-    fit_params = {}
+    # early_stopping_rounds is a constructor param in XGBoost 2+
     model_params = {k: v for k, v in params.items()}
-    if "early_stopping_rounds" in model_params:
-        fit_params["early_stopping_rounds"] = model_params.pop("early_stopping_rounds")
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
         X_train, X_val = X[train_idx], X[val_idx]
@@ -98,7 +95,6 @@ def train_cv(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
             verbose=False,
-            **fit_params,
         )
 
         val_preds = model.predict_proba(X_val)[:, 1]
@@ -110,8 +106,12 @@ def train_cv(
         importances += model.feature_importances_ / n_folds
         models.append(model)
 
+        try:
+            best_iter = model.best_iteration
+        except AttributeError:
+            best_iter = model_params.get("n_estimators", "?")
         log.info(f"  Fold {fold + 1}/{n_folds}: AUC = {fold_auc:.5f} "
-                 f"(best iter: {model.best_iteration})")
+                 f"(best iter: {best_iter})")
 
     mean_auc = np.mean(cv_scores)
     std_auc = np.std(cv_scores)
@@ -218,6 +218,7 @@ def tune_hyperparameters(
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
             "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 5.0),
+            "early_stopping_rounds": 50,
         }
 
         skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
@@ -232,7 +233,6 @@ def tune_hyperparameters(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
                 verbose=False,
-                early_stopping_rounds=50,
             )
             val_preds = model.predict_proba(X_val)[:, 1]
             from sklearn.metrics import roc_auc_score
