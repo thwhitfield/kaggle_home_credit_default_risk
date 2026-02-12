@@ -9,7 +9,9 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import polars as pl
+import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from home_credit.features.pipeline import build_all_features, get_feature_columns
 from home_credit.modeling.train import load_model, prepare_data, _target_encode_full, TARGET_ENCODE_COLS
@@ -21,11 +23,11 @@ COMPETITION = "home-credit-default-risk"
 
 
 def generate_submission(
-    test_df: pl.DataFrame,
+    test_df: DataFrame,
     model_data: dict,
     save_path: Path | None = None,
-    train_df: pl.DataFrame | None = None,
-) -> pl.DataFrame:
+    train_df: DataFrame | None = None,
+) -> pd.DataFrame:
     """Generate submission DataFrame from test data and trained models."""
     if save_path is None:
         save_path = OUTPUT_DIR / "submission.csv"
@@ -38,12 +40,14 @@ def generate_submission(
     te_cols = model_data.get("te_cols", [])
     numeric_cols = model_data.get("numeric_cols", [c for c in feature_names if not c.startswith("TE_")])
 
-    # Prepare numeric test features
+    # Prepare numeric test features — add missing columns as 0
     for c in numeric_cols:
         if c not in test_df.columns:
-            test_df = test_df.with_columns(pl.lit(0.0).cast(pl.Float32).alias(c))
+            test_df = test_df.withColumn(c, F.lit(0.0).cast("float"))
 
-    X_test = test_df.select(numeric_cols).to_numpy().astype(np.float32)
+    # Convert to pandas for numpy extraction
+    test_pdf = test_df.select(["SK_ID_CURR"] + numeric_cols).toPandas()
+    X_test = test_pdf[numeric_cols].to_numpy(dtype=np.float32)
 
     # Add target-encoded features if model uses them
     if te_cols and train_df is not None:
@@ -64,13 +68,13 @@ def generate_submission(
     for model in models:
         preds += model.predict_proba(X_test)[:, 1] / len(models)
 
-    submission = pl.DataFrame({
-        "SK_ID_CURR": test_df["SK_ID_CURR"],
+    submission = pd.DataFrame({
+        "SK_ID_CURR": test_pdf["SK_ID_CURR"],
         "TARGET": preds,
     })
 
-    submission.write_csv(save_path)
-    log.info(f"Submission saved to {save_path} ({submission.shape[0]:,} rows)")
+    submission.to_csv(save_path, index=False)
+    log.info(f"Submission saved to {save_path} ({len(submission):,} rows)")
     return submission
 
 
@@ -100,7 +104,7 @@ def submit_to_kaggle(message: str, submission_path: Path | None = None) -> None:
     log.info("Submission successful!")
 
 
-def fetch_kaggle_scores() -> pl.DataFrame:
+def fetch_kaggle_scores() -> pd.DataFrame:
     """Fetch all submission scores from Kaggle.
 
     Returns a DataFrame with columns: fileName, date, description, status,
@@ -120,12 +124,12 @@ def fetch_kaggle_scores() -> pl.DataFrame:
     rows = list(csv.DictReader(io.StringIO(result.stdout)))
     if not rows:
         log.warning("No submissions found on Kaggle")
-        return pl.DataFrame()
+        return pd.DataFrame()
 
-    return pl.DataFrame(rows)
+    return pd.DataFrame(rows)
 
 
-def sync_kaggle_scores() -> pl.DataFrame:
+def sync_kaggle_scores() -> pd.DataFrame:
     """Fetch scores from Kaggle and rewrite submission_log.csv with them.
 
     Matches Kaggle submissions to local log entries by description/message.
@@ -136,30 +140,30 @@ def sync_kaggle_scores() -> pl.DataFrame:
 
     # Fetch from Kaggle
     kaggle_df = fetch_kaggle_scores()
-    if kaggle_df.is_empty():
+    if kaggle_df.empty:
         log.info("No Kaggle submissions to sync")
         if log_path.exists():
-            return pl.read_csv(log_path)
-        return pl.DataFrame()
+            return pd.read_csv(log_path)
+        return pd.DataFrame()
 
-    log.info(f"Fetched {kaggle_df.shape[0]} submissions from Kaggle")
+    log.info(f"Fetched {len(kaggle_df)} submissions from Kaggle")
 
     # Read existing local log
     if log_path.exists():
-        local_df = pl.read_csv(log_path)
+        local_df = pd.read_csv(log_path)
     else:
-        local_df = pl.DataFrame({
-            "timestamp": [], "message": [], "cv_score": [],
-            "n_features": [], "kaggle_public_lb": [], "kaggle_private_lb": [],
-        })
+        local_df = pd.DataFrame(columns=[
+            "timestamp", "message", "cv_score",
+            "n_features", "kaggle_public_lb", "kaggle_private_lb",
+        ])
 
     # Ensure columns exist
     if "kaggle_private_lb" not in local_df.columns:
-        local_df = local_df.with_columns(pl.lit("").alias("kaggle_private_lb"))
+        local_df["kaggle_private_lb"] = ""
 
     # Build a lookup from kaggle description -> scores
     kaggle_lookup = {}
-    for row in kaggle_df.iter_rows(named=True):
+    for _, row in kaggle_df.iterrows():
         desc = row.get("description", "")
         public = row.get("publicScore", "")
         private = row.get("privateScore", "")
@@ -169,7 +173,7 @@ def sync_kaggle_scores() -> pl.DataFrame:
     # Update local log entries by matching message to description
     new_public = []
     new_private = []
-    for row in local_df.iter_rows(named=True):
+    for _, row in local_df.iterrows():
         msg = row["message"]
         if msg in kaggle_lookup:
             pub, priv = kaggle_lookup[msg]
@@ -179,23 +183,21 @@ def sync_kaggle_scores() -> pl.DataFrame:
             new_public.append(row.get("kaggle_public_lb", ""))
             new_private.append(row.get("kaggle_private_lb", ""))
 
-    updated = local_df.with_columns(
-        pl.Series("kaggle_public_lb", new_public),
-        pl.Series("kaggle_private_lb", new_private),
-    )
+    local_df["kaggle_public_lb"] = new_public
+    local_df["kaggle_private_lb"] = new_private
 
     # Write back
-    updated.write_csv(log_path)
+    local_df.to_csv(log_path, index=False)
     log.info(f"Updated {log_path} with Kaggle scores")
 
-    for row in updated.iter_rows(named=True):
+    for _, row in local_df.iterrows():
         pub = row["kaggle_public_lb"]
         priv = row["kaggle_private_lb"]
         cv = row["cv_score"]
-        msg = row["message"][:60]
+        msg = str(row["message"])[:60]
         log.info(f"  CV={cv}  Public={pub}  Private={priv}  | {msg}")
 
-    return updated
+    return local_df
 
 
 def log_submission(
@@ -249,7 +251,7 @@ def main():
     model_data = load_model(args.model)
     log.info(f"Loaded model: {args.model} (CV AUC: {model_data['mean_auc']:.5f})")
 
-    # Build features (will use cache)
+    # Build features
     train_df, test_df = build_all_features()
 
     # Generate submission (pass train_df for target encoding)

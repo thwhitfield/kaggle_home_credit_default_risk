@@ -7,8 +7,11 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import polars as pl
+import pandas as pd
 import xgboost as xgb
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, FloatType, IntegerType, LongType, ShortType, ByteType
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -47,29 +50,27 @@ TARGET_ENCODE_COLS = [
 
 
 def prepare_data(
-    train_df: pl.DataFrame,
+    train_df: DataFrame,
     feature_cols: list[str],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Convert Polars DataFrame to numpy arrays for XGBoost."""
+    """Convert Spark DataFrame to numpy arrays for XGBoost."""
     # Drop string/categorical columns that XGBoost can't handle directly
+    numeric_types = (DoubleType, FloatType, IntegerType, LongType, ShortType, ByteType)
     numeric_cols = []
+    schema = {f.name: f.dataType for f in train_df.schema.fields}
     for c in feature_cols:
-        dtype = train_df[c].dtype
-        if dtype in (
-            pl.Float32, pl.Float64,
-            pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-            pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-        ):
+        if c in schema and isinstance(schema[c], numeric_types):
             numeric_cols.append(c)
 
-    X = train_df.select(numeric_cols).to_numpy().astype(np.float32)
-    y = train_df["TARGET"].to_numpy().astype(np.float32)
+    pdf = train_df.select(numeric_cols + ["TARGET"]).toPandas()
+    X = pdf[numeric_cols].to_numpy(dtype=np.float32)
+    y = pdf["TARGET"].to_numpy(dtype=np.float32)
     return X, y, numeric_cols
 
 
 def _target_encode_fold(
-    train_df: pl.DataFrame,
-    val_df: pl.DataFrame,
+    train_pdf: pd.DataFrame,
+    val_pdf: pd.DataFrame,
     col: str,
     target_col: str = "TARGET",
     smoothing: float = 10.0,
@@ -77,67 +78,58 @@ def _target_encode_fold(
     """Target-encode a single column using training fold stats.
 
     Returns (train_encoded, val_encoded) as numpy arrays.
+    Operates on pandas DataFrames (inside the CV loop).
     """
-    global_mean = train_df[target_col].mean()
+    global_mean = train_pdf[target_col].mean()
 
     # Compute per-category stats from training data only
-    stats = (
-        train_df
-        .group_by(col)
-        .agg(
-            pl.col(target_col).mean().alias("cat_mean"),
-            pl.col(target_col).count().alias("cat_count"),
-        )
-        .with_columns(
-            (
-                (pl.col("cat_count") * pl.col("cat_mean") + smoothing * global_mean)
-                / (pl.col("cat_count") + smoothing)
-            ).alias("te_value")
-        )
-        .select(col, "te_value")
+    stats = train_pdf.groupby(col)[target_col].agg(["mean", "count"]).reset_index()
+    stats.columns = [col, "cat_mean", "cat_count"]
+    stats["te_value"] = (
+        (stats["cat_count"] * stats["cat_mean"] + smoothing * global_mean)
+        / (stats["cat_count"] + smoothing)
     )
+    stats = stats[[col, "te_value"]]
 
     # Join onto train and val
-    train_encoded = train_df.join(stats, on=col, how="left")["te_value"].fill_null(global_mean).to_numpy().astype(np.float32)
-    val_encoded = val_df.join(stats, on=col, how="left")["te_value"].fill_null(global_mean).to_numpy().astype(np.float32)
+    train_encoded = train_pdf[[col]].merge(stats, on=col, how="left")["te_value"].fillna(global_mean).to_numpy(dtype=np.float32)
+    val_encoded = val_pdf[[col]].merge(stats, on=col, how="left")["te_value"].fillna(global_mean).to_numpy(dtype=np.float32)
 
     return train_encoded, val_encoded
 
 
 def _target_encode_full(
-    train_df: pl.DataFrame,
-    test_df: pl.DataFrame,
+    train_df: DataFrame,
+    test_df: DataFrame,
     col: str,
     target_col: str = "TARGET",
     smoothing: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Target-encode using full training set (for test predictions)."""
-    global_mean = train_df[target_col].mean()
+    """Target-encode using full training set (for test predictions).
 
-    stats = (
-        train_df
-        .group_by(col)
-        .agg(
-            pl.col(target_col).mean().alias("cat_mean"),
-            pl.col(target_col).count().alias("cat_count"),
-        )
-        .with_columns(
-            (
-                (pl.col("cat_count") * pl.col("cat_mean") + smoothing * global_mean)
-                / (pl.col("cat_count") + smoothing)
-            ).alias("te_value")
-        )
-        .select(col, "te_value")
+    Accepts Spark DataFrames, converts to pandas internally.
+    """
+    train_pdf = train_df.select(col, target_col).toPandas()
+    test_pdf = test_df.select(col).toPandas()
+
+    global_mean = train_pdf[target_col].mean()
+
+    stats = train_pdf.groupby(col)[target_col].agg(["mean", "count"]).reset_index()
+    stats.columns = [col, "cat_mean", "cat_count"]
+    stats["te_value"] = (
+        (stats["cat_count"] * stats["cat_mean"] + smoothing * global_mean)
+        / (stats["cat_count"] + smoothing)
     )
+    stats = stats[[col, "te_value"]]
 
-    train_encoded = train_df.join(stats, on=col, how="left")["te_value"].fill_null(global_mean).to_numpy().astype(np.float32)
-    test_encoded = test_df.join(stats, on=col, how="left")["te_value"].fill_null(global_mean).to_numpy().astype(np.float32)
+    train_encoded = train_pdf[[col]].merge(stats, on=col, how="left")["te_value"].fillna(global_mean).to_numpy(dtype=np.float32)
+    test_encoded = test_pdf[[col]].merge(stats, on=col, how="left")["te_value"].fillna(global_mean).to_numpy(dtype=np.float32)
 
     return train_encoded, test_encoded
 
 
 def train_cv(
-    train_df: pl.DataFrame,
+    train_df: DataFrame,
     params: dict | None = None,
     n_folds: int = 5,
     feature_cols: list[str] | None = None,
@@ -160,6 +152,10 @@ def train_cv(
     te_col_names = [f"TE_{c}" for c in te_cols_present]
     all_feature_names = numeric_cols + te_col_names
 
+    # Convert to pandas once for target encoding inside CV folds
+    if te_cols_present:
+        te_pdf = train_df.select(te_cols_present + ["TARGET"]).toPandas()
+
     log.info(f"Training data: {X.shape[0]:,} samples, {len(all_feature_names)} features "
              f"({X.shape[1]} numeric + {len(te_cols_present)} target-encoded)")
 
@@ -178,13 +174,13 @@ def train_cv(
 
         # Add target-encoded features (computed per fold to avoid leakage)
         if te_cols_present:
-            fold_train_df = train_df[train_idx]
-            fold_val_df = train_df[val_idx]
+            fold_train_pdf = te_pdf.iloc[train_idx]
+            fold_val_pdf = te_pdf.iloc[val_idx]
 
             te_train_arrays = []
             te_val_arrays = []
             for col in te_cols_present:
-                te_tr, te_va = _target_encode_fold(fold_train_df, fold_val_df, col)
+                te_tr, te_va = _target_encode_fold(fold_train_pdf, fold_val_pdf, col)
                 te_train_arrays.append(te_tr.reshape(-1, 1))
                 te_val_arrays.append(te_va.reshape(-1, 1))
 
@@ -237,7 +233,7 @@ def train_cv(
 
 
 def train_lightgbm_cv(
-    train_df: pl.DataFrame,
+    train_df: DataFrame,
     params: dict | None = None,
     n_folds: int = 5,
     feature_cols: list[str] | None = None,
@@ -274,6 +270,10 @@ def train_lightgbm_cv(
     te_col_names = [f"TE_{c}" for c in te_cols_present]
     all_feature_names = numeric_cols + te_col_names
 
+    # Convert to pandas once for target encoding inside CV folds
+    if te_cols_present:
+        te_pdf = train_df.select(te_cols_present + ["TARGET"]).toPandas()
+
     log.info(f"LightGBM training: {X.shape[0]:,} samples, {len(all_feature_names)} features")
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
@@ -291,13 +291,13 @@ def train_lightgbm_cv(
         y_train, y_val = y[train_idx], y[val_idx]
 
         if te_cols_present:
-            fold_train_df = train_df[train_idx]
-            fold_val_df = train_df[val_idx]
+            fold_train_pdf = te_pdf.iloc[train_idx]
+            fold_val_pdf = te_pdf.iloc[val_idx]
 
             te_train_arrays = []
             te_val_arrays = []
             for col in te_cols_present:
-                te_tr, te_va = _target_encode_fold(fold_train_df, fold_val_df, col)
+                te_tr, te_va = _target_encode_fold(fold_train_pdf, fold_val_pdf, col)
                 te_train_arrays.append(te_tr.reshape(-1, 1))
                 te_val_arrays.append(te_va.reshape(-1, 1))
 
@@ -352,7 +352,7 @@ def train_lightgbm_cv(
 
 
 def train_catboost_cv(
-    train_df: pl.DataFrame,
+    train_df: DataFrame,
     params: dict | None = None,
     n_folds: int = 5,
     feature_cols: list[str] | None = None,
@@ -385,6 +385,10 @@ def train_catboost_cv(
     te_col_names = [f"TE_{c}" for c in te_cols_present]
     all_feature_names = numeric_cols + te_col_names
 
+    # Convert to pandas once for target encoding inside CV folds
+    if te_cols_present:
+        te_pdf = train_df.select(te_cols_present + ["TARGET"]).toPandas()
+
     log.info(f"CatBoost training: {X.shape[0]:,} samples, {len(all_feature_names)} features")
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
@@ -401,13 +405,13 @@ def train_catboost_cv(
         y_train, y_val = y[train_idx], y[val_idx]
 
         if te_cols_present:
-            fold_train_df = train_df[train_idx]
-            fold_val_df = train_df[val_idx]
+            fold_train_pdf = te_pdf.iloc[train_idx]
+            fold_val_pdf = te_pdf.iloc[val_idx]
 
             te_train_arrays = []
             te_val_arrays = []
             for col in te_cols_present:
-                te_tr, te_va = _target_encode_fold(fold_train_df, fold_val_df, col)
+                te_tr, te_va = _target_encode_fold(fold_train_pdf, fold_val_pdf, col)
                 te_train_arrays.append(te_tr.reshape(-1, 1))
                 te_val_arrays.append(te_va.reshape(-1, 1))
 
@@ -590,7 +594,7 @@ def load_model(name: str = "best_model") -> dict:
 
 
 def tune_hyperparameters(
-    train_df: pl.DataFrame,
+    train_df: DataFrame,
     n_trials: int = 30,
     n_folds: int = 5,
     feature_cols: list[str] | None = None,

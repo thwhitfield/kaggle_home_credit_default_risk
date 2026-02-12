@@ -1,7 +1,6 @@
 """Run the full experimentation pipeline: feature selection + tuning + retrain."""
 
 import numpy as np
-import polars as pl
 
 from home_credit.features.pipeline import build_all_features, get_feature_columns
 from home_credit.modeling.evaluate import plot_feature_importance

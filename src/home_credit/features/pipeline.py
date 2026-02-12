@@ -2,7 +2,8 @@
 
 from pathlib import Path
 
-import polars as pl
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from home_credit.data.loader import load_table
 from home_credit.features.application import build_application_features
@@ -17,172 +18,166 @@ from home_credit.utils import DATA_DIR, FEATURES_DIR, get_logger, timer
 log = get_logger(__name__)
 
 
-def _build_and_save(name: str, builder, features_dir: Path, **kwargs) -> pl.DataFrame:
-    """Build a feature set, save to parquet, and return it."""
-    parquet_path = features_dir / f"{name}.parquet"
-    if parquet_path.exists():
-        log.info(f"Loading cached {name} features from {parquet_path}")
-        return pl.read_parquet(parquet_path)
-
-    with timer(f"Building {name} features", log):
-        feats = builder(**kwargs)
-    feats.write_parquet(parquet_path)
-    log.info(f"Saved {name} features: {feats.shape[1]} columns, {feats.shape[0]:,} rows")
-    return feats
-
-
-def _add_cross_table_features(df: pl.DataFrame) -> pl.DataFrame:
+def _add_cross_table_features(df: DataFrame) -> DataFrame:
     """Add interaction features that combine signals across tables."""
     log.info("Adding cross-table interaction features")
 
-    exprs = []
+    cols = set(df.columns)
 
     # --- Bureau debt relative to current application ---
-    if "BUR_DEBT_TOTAL" in df.columns and "AMT_CREDIT" in df.columns:
-        exprs.append(
-            (pl.col("BUR_DEBT_TOTAL").fill_null(0) / (pl.col("AMT_CREDIT") + 1))
-            .alias("CROSS_EXISTING_DEBT_TO_NEW_CREDIT")
+    if "BUR_DEBT_TOTAL" in cols and "AMT_CREDIT" in cols:
+        df = df.withColumn(
+            "CROSS_EXISTING_DEBT_TO_NEW_CREDIT",
+            F.coalesce(F.col("BUR_DEBT_TOTAL"), F.lit(0)) / (F.col("AMT_CREDIT") + 1)
         )
 
     # --- Total credit exposure relative to income ---
-    if "BUR_AMT_CREDIT_TOTAL" in df.columns and "AMT_INCOME_TOTAL" in df.columns:
-        exprs.append(
-            ((pl.col("BUR_AMT_CREDIT_TOTAL").fill_null(0) + pl.col("AMT_CREDIT"))
-             / (pl.col("AMT_INCOME_TOTAL") + 1))
-            .alias("CROSS_TOTAL_CREDIT_TO_INCOME")
+    if "BUR_AMT_CREDIT_TOTAL" in cols and "AMT_INCOME_TOTAL" in cols:
+        df = df.withColumn(
+            "CROSS_TOTAL_CREDIT_TO_INCOME",
+            (F.coalesce(F.col("BUR_AMT_CREDIT_TOTAL"), F.lit(0)) + F.col("AMT_CREDIT"))
+            / (F.col("AMT_INCOME_TOTAL") + 1)
         )
 
     # --- Bureau annuity burden combined with current annuity ---
-    if "BUR_ACTIVE_ANNUITY_TOTAL" in df.columns and "AMT_ANNUITY" in df.columns:
-        exprs.append(
-            ((pl.col("BUR_ACTIVE_ANNUITY_TOTAL").fill_null(0)
-              + pl.col("AMT_ANNUITY").fill_null(0))
-             / (pl.col("AMT_INCOME_TOTAL") + 1))
-            .alias("CROSS_TOTAL_ANNUITY_TO_INCOME")
+    if "BUR_ACTIVE_ANNUITY_TOTAL" in cols and "AMT_ANNUITY" in cols:
+        df = df.withColumn(
+            "CROSS_TOTAL_ANNUITY_TO_INCOME",
+            (F.coalesce(F.col("BUR_ACTIVE_ANNUITY_TOTAL"), F.lit(0))
+             + F.coalesce(F.col("AMT_ANNUITY"), F.lit(0)))
+            / (F.col("AMT_INCOME_TOTAL") + 1)
         )
 
     # --- Refusal rate crossed with credit amount ---
-    if "PREV_REFUSAL_RATE" in df.columns:
-        exprs.append(
-            (pl.col("PREV_REFUSAL_RATE").fill_null(0) * pl.col("AMT_CREDIT"))
-            .alias("CROSS_REFUSAL_RATE_x_CREDIT")
+    if "PREV_REFUSAL_RATE" in cols:
+        df = df.withColumn(
+            "CROSS_REFUSAL_RATE_x_CREDIT",
+            F.coalesce(F.col("PREV_REFUSAL_RATE"), F.lit(0)) * F.col("AMT_CREDIT")
         )
 
     # --- External score crossed with late payment behavior ---
-    if "INS_LATE_RATE" in df.columns and "EXT_SOURCE_2" in df.columns:
-        exprs.append(
-            (pl.col("EXT_SOURCE_2").fill_null(0) * pl.col("INS_LATE_RATE").fill_null(0))
-            .alias("CROSS_EXT2_x_LATE_RATE")
+    if "INS_LATE_RATE" in cols and "EXT_SOURCE_2" in cols:
+        df = df.withColumn(
+            "CROSS_EXT2_x_LATE_RATE",
+            F.coalesce(F.col("EXT_SOURCE_2"), F.lit(0))
+            * F.coalesce(F.col("INS_LATE_RATE"), F.lit(0))
         )
 
-    # --- Is this a first-time applicant? (no previous applications) ---
-    if "PREV_COUNT" in df.columns:
-        exprs.append(
-            pl.col("PREV_COUNT").is_null().cast(pl.Int8)
-            .alias("CROSS_FIRST_TIME_APPLICANT")
+    # --- Is this a first-time applicant? ---
+    if "PREV_COUNT" in cols:
+        df = df.withColumn(
+            "CROSS_FIRST_TIME_APPLICANT",
+            F.when(F.col("PREV_COUNT").isNull(), 1).otherwise(0)
         )
-    if "BUR_COUNT" in df.columns:
-        exprs.append(
-            pl.col("BUR_COUNT").is_null().cast(pl.Int8)
-            .alias("CROSS_NO_BUREAU_HISTORY")
+    if "BUR_COUNT" in cols:
+        df = df.withColumn(
+            "CROSS_NO_BUREAU_HISTORY",
+            F.when(F.col("BUR_COUNT").isNull(), 1).otherwise(0)
         )
 
     # --- Credit amount vs previous approved amount (escalation risk) ---
-    if "PREV_APPROVED_CREDIT_MEAN" in df.columns:
-        exprs.append(
-            (pl.col("AMT_CREDIT") / (pl.col("PREV_APPROVED_CREDIT_MEAN").fill_null(0) + 1))
-            .alias("CROSS_CREDIT_VS_PREV_APPROVED")
+    if "PREV_APPROVED_CREDIT_MEAN" in cols:
+        df = df.withColumn(
+            "CROSS_CREDIT_VS_PREV_APPROVED",
+            F.col("AMT_CREDIT")
+            / (F.coalesce(F.col("PREV_APPROVED_CREDIT_MEAN"), F.lit(0)) + 1)
         )
 
-    # --- Combined DPD risk score (across bureau, POS, CC, installments) ---
-    dpd_cols = []
-    if "BUR_BB_DPD_RATE_MEAN" in df.columns:
-        dpd_cols.append(pl.col("BUR_BB_DPD_RATE_MEAN").fill_null(0))
-    if "POS_DPD_RATE" in df.columns:
-        dpd_cols.append(pl.col("POS_DPD_RATE").fill_null(0))
-    if "CC_DPD_RATE" in df.columns:
-        dpd_cols.append(pl.col("CC_DPD_RATE").fill_null(0))
-    if "INS_LATE_RATE" in df.columns:
-        dpd_cols.append(pl.col("INS_LATE_RATE").fill_null(0))
-    if len(dpd_cols) >= 2:
-        exprs.append(
-            pl.sum_horizontal(dpd_cols).alias("CROSS_COMBINED_DPD_SCORE")
+    # --- Combined DPD risk score ---
+    dpd_exprs = []
+    for c in ["BUR_BB_DPD_RATE_MEAN", "POS_DPD_RATE", "CC_DPD_RATE", "INS_LATE_RATE"]:
+        if c in cols:
+            dpd_exprs.append(F.coalesce(F.col(c), F.lit(0)))
+    if len(dpd_exprs) >= 2:
+        combined = dpd_exprs[0]
+        for expr in dpd_exprs[1:]:
+            combined = combined + expr
+        df = df.withColumn("CROSS_COMBINED_DPD_SCORE", combined)
+
+    # --- EXT_SOURCE × bureau delinquency ---
+    if "EXT_SOURCE_3" in cols and "BUR_BB_DPD_RATE_MEAN" in cols:
+        df = df.withColumn(
+            "CROSS_EXT3_ADJUSTED_BY_DPD",
+            F.coalesce(F.col("EXT_SOURCE_3"), F.lit(0))
+            * (1 - F.coalesce(F.col("BUR_BB_DPD_RATE_MEAN"), F.lit(0)))
+        )
+    if "EXT_SOURCE_2" in cols and "BUR_OVERDUE_RATE" in cols:
+        df = df.withColumn(
+            "CROSS_EXT2_ADJUSTED_BY_OVERDUE",
+            F.coalesce(F.col("EXT_SOURCE_2"), F.lit(0))
+            * (1 - F.coalesce(F.col("BUR_OVERDUE_RATE"), F.lit(0)))
         )
 
-    # --- EXT_SOURCE × bureau delinquency (credit score penalized by DPD) ---
-    if "EXT_SOURCE_3" in df.columns and "BUR_BB_DPD_RATE_MEAN" in df.columns:
-        exprs.append(
-            (pl.col("EXT_SOURCE_3").fill_null(0) * (1 - pl.col("BUR_BB_DPD_RATE_MEAN").fill_null(0)))
-            .alias("CROSS_EXT3_ADJUSTED_BY_DPD")
-        )
-    if "EXT_SOURCE_2" in df.columns and "BUR_OVERDUE_RATE" in df.columns:
-        exprs.append(
-            (pl.col("EXT_SOURCE_2").fill_null(0) * (1 - pl.col("BUR_OVERDUE_RATE").fill_null(0)))
-            .alias("CROSS_EXT2_ADJUSTED_BY_OVERDUE")
+    # --- Income × active debt load ---
+    if "BUR_ACTIVE_DEBT_TOTAL" in cols and "AMT_INCOME_TOTAL" in cols:
+        df = df.withColumn(
+            "CROSS_ACTIVE_DEBT_TO_INCOME",
+            F.coalesce(F.col("BUR_ACTIVE_DEBT_TOTAL"), F.lit(0))
+            / (F.col("AMT_INCOME_TOTAL") + 1)
         )
 
-    # --- Income × active debt load (debt-to-income from bureau) ---
-    if "BUR_ACTIVE_DEBT_TOTAL" in df.columns and "AMT_INCOME_TOTAL" in df.columns:
-        exprs.append(
-            (pl.col("BUR_ACTIVE_DEBT_TOTAL").fill_null(0) / (pl.col("AMT_INCOME_TOTAL") + 1))
-            .alias("CROSS_ACTIVE_DEBT_TO_INCOME")
-        )
-
-    # --- Age × credit card utilization (young + high utilization = risky) ---
-    if "CC_UTILIZATION_MEAN" in df.columns and "DAYS_BIRTH" in df.columns:
-        exprs.append(
-            (pl.col("CC_UTILIZATION_MEAN").fill_null(0) / ((pl.col("DAYS_BIRTH") / -365.25) + 1))
-            .alias("CROSS_CC_UTIL_PER_AGE")
+    # --- Age × credit card utilization ---
+    if "CC_UTILIZATION_MEAN" in cols and "DAYS_BIRTH" in cols:
+        df = df.withColumn(
+            "CROSS_CC_UTIL_PER_AGE",
+            F.coalesce(F.col("CC_UTILIZATION_MEAN"), F.lit(0))
+            / ((F.col("DAYS_BIRTH") / -365.25) + 1)
         )
 
     # --- Employment stability × payment behavior ---
-    if "INS_LATE_RATE" in df.columns and "DAYS_EMPLOYED" in df.columns:
-        exprs.append(
-            (pl.col("INS_LATE_RATE").fill_null(0) * (pl.col("DAYS_EMPLOYED").fill_null(0) / -365.25).clip(0, 50))
-            .alias("CROSS_LATE_RATE_x_EMPLOYMENT")
+    if "INS_LATE_RATE" in cols and "DAYS_EMPLOYED" in cols:
+        df = df.withColumn(
+            "CROSS_LATE_RATE_x_EMPLOYMENT",
+            F.coalesce(F.col("INS_LATE_RATE"), F.lit(0))
+            * F.greatest(F.lit(0), F.least(F.lit(50),
+              F.coalesce(F.col("DAYS_EMPLOYED"), F.lit(0)) / -365.25))
         )
 
-    # --- Total supplementary table null count (thin file indicator) ---
-    supp_null_cols = []
+    # --- Thin file indicator ---
+    supp_null_exprs = []
     for c in ["BUR_COUNT", "PREV_COUNT", "INS_COUNT", "POS_COUNT", "CC_COUNT"]:
-        if c in df.columns:
-            supp_null_cols.append(pl.col(c).is_null().cast(pl.Int8))
-    if supp_null_cols:
-        exprs.append(
-            pl.sum_horizontal(supp_null_cols).alias("CROSS_THIN_FILE_SCORE")
-        )
+        if c in cols:
+            supp_null_exprs.append(F.when(F.col(c).isNull(), 1).otherwise(0))
+    if supp_null_exprs:
+        combined = supp_null_exprs[0]
+        for expr in supp_null_exprs[1:]:
+            combined = combined + expr
+        df = df.withColumn("CROSS_THIN_FILE_SCORE", combined)
 
-    # --- Recent behavior risk score (combines recent DPD signals) ---
+    # --- Recent behavior risk score ---
     recent_dpd = []
-    if "BUR_BB_RECENT_6M_DPD_RATE_MEAN" in df.columns:
-        recent_dpd.append(pl.col("BUR_BB_RECENT_6M_DPD_RATE_MEAN").fill_null(0))
-    if "POS_RECENT_6M_DPD_RATE" in df.columns:
-        recent_dpd.append(pl.col("POS_RECENT_6M_DPD_RATE").fill_null(0))
-    if "INS_RECENT_12_LATE_RATE" in df.columns:
-        recent_dpd.append(pl.col("INS_RECENT_12_LATE_RATE").fill_null(0))
-    if "CC_RECENT_12M_DPD_COUNT" in df.columns:
-        recent_dpd.append((pl.col("CC_RECENT_12M_DPD_COUNT").fill_null(0) / 12.0))
+    for c, divisor in [
+        ("BUR_BB_RECENT_6M_DPD_RATE_MEAN", None),
+        ("POS_RECENT_6M_DPD_RATE", None),
+        ("INS_RECENT_12_LATE_RATE", None),
+        ("CC_RECENT_12M_DPD_COUNT", 12.0),
+    ]:
+        if c in cols:
+            expr = F.coalesce(F.col(c), F.lit(0))
+            if divisor is not None:
+                expr = expr / divisor
+            recent_dpd.append(expr)
     if len(recent_dpd) >= 2:
-        exprs.append(
-            pl.sum_horizontal(recent_dpd).alias("CROSS_RECENT_DPD_SCORE")
+        combined = recent_dpd[0]
+        for expr in recent_dpd[1:]:
+            combined = combined + expr
+        df = df.withColumn("CROSS_RECENT_DPD_SCORE", combined)
+
+    # --- Worsening behavior score ---
+    if "CC_UTIL_TREND_12M" in cols and "INS_RECENT_12_PAYMENT_RATIO" in cols:
+        df = df.withColumn(
+            "CROSS_WORSENING_BEHAVIOR_SCORE",
+            F.coalesce(F.col("CC_UTIL_TREND_12M"), F.lit(0))
+            - F.coalesce(F.col("INS_RECENT_12_PAYMENT_RATIO"), F.lit(1)) + 1
         )
 
-    # --- Credit utilization trend (worsening across products) ---
-    if "CC_UTIL_TREND_12M" in df.columns and "INS_RECENT_12_PAYMENT_RATIO" in df.columns:
-        exprs.append(
-            (pl.col("CC_UTIL_TREND_12M").fill_null(0) - pl.col("INS_RECENT_12_PAYMENT_RATIO").fill_null(1) + 1)
-            .alias("CROSS_WORSENING_BEHAVIOR_SCORE")
+    # --- Previous app count × EXT_SOURCE ---
+    if "PREV_COUNT" in cols and "APP_EXT_SOURCE_MEAN" in cols:
+        df = df.withColumn(
+            "CROSS_EXPERIENCE_x_SCORE",
+            F.log1p(F.coalesce(F.col("PREV_COUNT"), F.lit(0)))
+            * F.coalesce(F.col("APP_EXT_SOURCE_MEAN"), F.lit(0))
         )
-
-    # --- Previous app count × EXT_SOURCE (experienced + good score = low risk) ---
-    if "PREV_COUNT" in df.columns and "APP_EXT_SOURCE_MEAN" in df.columns:
-        exprs.append(
-            (pl.col("PREV_COUNT").fill_null(0).log1p() * pl.col("APP_EXT_SOURCE_MEAN").fill_null(0))
-            .alias("CROSS_EXPERIENCE_x_SCORE")
-        )
-
-    if exprs:
-        df = df.with_columns(exprs)
 
     return df
 
@@ -191,76 +186,68 @@ def build_all_features(
     data_dir: Path = DATA_DIR,
     features_dir: Path = FEATURES_DIR,
     use_cache: bool = True,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
+) -> tuple[DataFrame, DataFrame]:
     """Build all features and return (train_df, test_df) with TARGET column.
 
     Returns DataFrames ready for model training (all features joined).
     """
     features_dir.mkdir(parents=True, exist_ok=True)
 
-    final_train_path = features_dir / "train_final.parquet"
-    final_test_path = features_dir / "test_final.parquet"
-
-    if use_cache and final_train_path.exists() and final_test_path.exists():
-        log.info("Loading cached final feature sets")
-        return pl.read_parquet(final_train_path), pl.read_parquet(final_test_path)
-
     # --- Application features (both train and test) ---
-    app_train = _build_and_save(
-        "app_train", build_application_features, features_dir,
-        app=load_table("application_train", data_dir),
-    )
-    app_test = _build_and_save(
-        "app_test", build_application_features, features_dir,
-        app=load_table("application_test", data_dir),
-    )
+    with timer("Building application train features", log):
+        app_train = build_application_features(
+            app=load_table("application_train", data_dir),
+        )
+    with timer("Building application test features", log):
+        app_test = build_application_features(
+            app=load_table("application_test", data_dir),
+        )
 
     # --- Supplementary table features (shared between train and test) ---
-    bureau_feats = _build_and_save(
-        "bureau", build_bureau_features, features_dir,
-        bureau=load_table("bureau", data_dir),
-        bureau_balance=load_table("bureau_balance", data_dir),
-    )
+    with timer("Building bureau features", log):
+        bureau_feats = build_bureau_features(
+            bureau=load_table("bureau", data_dir),
+            bureau_balance=load_table("bureau_balance", data_dir),
+        )
 
-    prev_feats = _build_and_save(
-        "previous", build_previous_application_features, features_dir,
-        prev=load_table("previous_application", data_dir),
-    )
+    with timer("Building previous application features", log):
+        prev_feats = build_previous_application_features(
+            prev=load_table("previous_application", data_dir),
+        )
 
-    installment_feats = _build_and_save(
-        "installments", build_installment_features, features_dir,
-        installments=load_table("installments_payments", data_dir),
-    )
+    with timer("Building installment features", log):
+        installment_feats = build_installment_features(
+            installments=load_table("installments_payments", data_dir),
+        )
 
-    pos_feats = _build_and_save(
-        "pos_cash", build_pos_cash_features, features_dir,
-        pos=load_table("POS_CASH_balance", data_dir),
-    )
+    with timer("Building POS/cash features", log):
+        pos_feats = build_pos_cash_features(
+            pos=load_table("POS_CASH_balance", data_dir),
+        )
 
-    cc_feats = _build_and_save(
-        "credit_card", build_credit_card_features, features_dir,
-        cc=load_table("credit_card_balance", data_dir),
-    )
+    with timer("Building credit card features", log):
+        cc_feats = build_credit_card_features(
+            cc=load_table("credit_card_balance", data_dir),
+        )
 
-    # --- Experimental features (H2: trajectory, H3: time-since, H4: untapped, H5: per-type) ---
-    exp_feats = _build_and_save(
-        "experimental_v4", build_winning_experimental_features, features_dir,
-        installments=load_table("installments_payments", data_dir),
-        cc=load_table("credit_card_balance", data_dir),
-        pos=load_table("POS_CASH_balance", data_dir),
-        bureau=load_table("bureau", data_dir),
-        bureau_balance=load_table("bureau_balance", data_dir),
-        prev=load_table("previous_application", data_dir),
-    )
+    # --- Experimental features ---
+    with timer("Building experimental features", log):
+        exp_feats = build_winning_experimental_features(
+            installments=load_table("installments_payments", data_dir),
+            cc=load_table("credit_card_balance", data_dir),
+            pos=load_table("POS_CASH_balance", data_dir),
+            bureau=load_table("bureau", data_dir),
+            bureau_balance=load_table("bureau_balance", data_dir),
+            prev=load_table("previous_application", data_dir),
+        )
 
     # --- Join all supplementary features onto application ---
     supp_tables = [bureau_feats, prev_feats, installment_feats, pos_feats, cc_feats, exp_feats]
 
-    def join_all(app_df: pl.DataFrame) -> pl.DataFrame:
+    def join_all(app_df: DataFrame) -> DataFrame:
         result = app_df
         for feats_df in supp_tables:
-            result = result.join(feats_df, on="SK_ID_CURR", how="left")
-        # Add cross-table interaction features
+            result = result.join(feats_df, "SK_ID_CURR", "left")
         result = _add_cross_table_features(result)
         return result
 
@@ -268,18 +255,22 @@ def build_all_features(
         train_df = join_all(app_train)
         test_df = join_all(app_test)
 
-    log.info(f"Final train shape: {train_df.shape}")
-    log.info(f"Final test shape: {test_df.shape}")
+    train_count = train_df.count()
+    test_count = test_df.count()
+    log.info(f"Final train shape: ({train_count}, {len(train_df.columns)})")
+    log.info(f"Final test shape: ({test_count}, {len(test_df.columns)})")
 
     # Save final datasets
-    train_df.write_parquet(final_train_path)
-    test_df.write_parquet(final_test_path)
+    final_train_path = str(features_dir / "train_final.parquet")
+    final_test_path = str(features_dir / "test_final.parquet")
+    train_df.write.mode("overwrite").parquet(final_train_path)
+    test_df.write.mode("overwrite").parquet(final_test_path)
     log.info("Saved final feature sets to parquet")
 
     return train_df, test_df
 
 
-def get_feature_columns(df: pl.DataFrame) -> list[str]:
+def get_feature_columns(df: DataFrame) -> list[str]:
     """Get feature columns (everything except SK_ID_CURR and TARGET)."""
     exclude = {"SK_ID_CURR", "TARGET"}
     return [c for c in df.columns if c not in exclude]
@@ -287,18 +278,16 @@ def get_feature_columns(df: pl.DataFrame) -> list[str]:
 
 if __name__ == "__main__":
     train_df, test_df = build_all_features(use_cache=False)
-    print(f"\nTrain: {train_df.shape[0]:,} rows x {train_df.shape[1]} features")
-    print(f"Test:  {test_df.shape[0]:,} rows x {test_df.shape[1]} features")
+    train_count = train_df.count()
+    test_count = test_df.count()
+    print(f"\nTrain: {train_count:,} rows x {len(train_df.columns)} features")
+    print(f"Test:  {test_count:,} rows x {len(test_df.columns)} features")
     feature_cols = get_feature_columns(train_df)
     print(f"Feature columns: {len(feature_cols)}")
 
     # Show nulls
-    null_pcts = {
-        c: train_df[c].null_count() / train_df.shape[0] * 100
-        for c in feature_cols
-    }
-    high_null = {k: v for k, v in null_pcts.items() if v > 50}
-    if high_null:
-        print(f"\nHigh null features (>50%): {len(high_null)}")
-        for k, v in sorted(high_null.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {k}: {v:.1f}%")
+    for c in feature_cols:
+        null_count = train_df.filter(F.col(c).isNull()).count()
+        null_pct = null_count / train_count * 100
+        if null_pct > 50:
+            print(f"  {c}: {null_pct:.1f}%")

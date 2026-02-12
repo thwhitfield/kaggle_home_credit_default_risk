@@ -2,9 +2,9 @@
 
 from pathlib import Path
 
-import polars as pl
+from pyspark.sql import functions as F
 
-from home_credit.utils import DATA_DIR, OUTPUT_DIR, get_logger
+from home_credit.utils import DATA_DIR, OUTPUT_DIR, get_logger, get_spark_session
 
 log = get_logger(__name__)
 
@@ -22,37 +22,42 @@ TABLE_NAMES = [
 
 def profile_table(name: str, data_dir: Path = DATA_DIR) -> str:
     """Generate a markdown profile for a single table."""
+    spark = get_spark_session()
     path = data_dir / f"{name}.csv"
-    df = pl.read_csv(path, n_rows=0)  # schema only
-    schema = dict(df.schema)
+    df = spark.read.csv(str(path), header=True, inferSchema=True)
 
-    df = pl.scan_csv(path).collect()
-    n_rows = df.shape[0]
-    n_cols = df.shape[1]
+    n_rows = df.count()
+    n_cols = len(df.columns)
 
     lines = [f"### {name}", f"- **Rows**: {n_rows:,}", f"- **Columns**: {n_cols}", ""]
 
-    # Column details
     lines.append("| Column | Dtype | Missing % | Unique | Min | Max | Mean |")
     lines.append("|--------|-------|-----------|--------|-----|-----|------|")
 
-    for col_name in df.columns:
-        col = df[col_name]
-        dtype = str(schema.get(col_name, col.dtype))
-        null_pct = col.null_count() / n_rows * 100 if n_rows > 0 else 0
-        n_unique = col.n_unique()
+    numeric_types = {"int", "bigint", "smallint", "tinyint", "float", "double"}
 
-        if col.dtype in (pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int16, pl.Int8):
-            min_val = f"{col.min()}"
-            max_val = f"{col.max()}"
-            mean_val = f"{col.mean():.2f}" if col.mean() is not None else "—"
+    for col_name, dtype in df.dtypes:
+        null_count = df.filter(F.col(col_name).isNull()).count()
+        null_pct = null_count / n_rows * 100 if n_rows > 0 else 0
+        n_unique = df.select(F.countDistinct(col_name)).collect()[0][0]
+
+        if dtype in numeric_types:
+            stats = df.select(
+                F.min(col_name).alias("min_val"),
+                F.max(col_name).alias("max_val"),
+                F.avg(col_name).alias("mean_val"),
+            ).collect()[0]
+            min_val = str(stats["min_val"]) if stats["min_val"] is not None else "—"
+            max_val = str(stats["max_val"]) if stats["max_val"] is not None else "—"
+            mean_val = f"{stats['mean_val']:.2f}" if stats["mean_val"] is not None else "—"
         else:
             min_val = "—"
             max_val = "—"
             mean_val = "—"
 
         lines.append(
-            f"| {col_name} | {dtype} | {null_pct:.1f}% | {n_unique:,} | {min_val} | {max_val} | {mean_val} |"
+            f"| {col_name} | {dtype} | {null_pct:.1f}% | {n_unique:,} "
+            f"| {min_val} | {max_val} | {mean_val} |"
         )
 
     lines.append("")
@@ -65,7 +70,6 @@ def profile_all(data_dir: Path = DATA_DIR, output_dir: Path = OUTPUT_DIR) -> str
 
     sections = ["# Data Profile — Home Credit Default Risk", ""]
 
-    # Table relationships
     sections.append("## Table Relationships")
     sections.append("")
     sections.append("All tables join to the main application table via `SK_ID_CURR`:")
@@ -91,7 +95,6 @@ def profile_all(data_dir: Path = DATA_DIR, output_dir: Path = OUTPUT_DIR) -> str
     sections.append("---")
     sections.append("")
 
-    # Profile each table
     sections.append("## Table Profiles")
     sections.append("")
 
@@ -101,20 +104,21 @@ def profile_all(data_dir: Path = DATA_DIR, output_dir: Path = OUTPUT_DIR) -> str
             sections.append(profile_table(name, data_dir))
             sections.append("---")
             sections.append("")
-        except FileNotFoundError:
+        except Exception:
             log.warning(f"Table {name} not found, skipping")
             sections.append(f"### {name}\n\n*File not found*\n\n---\n")
 
-    # Target distribution
+    spark = get_spark_session()
     train_path = data_dir / "application_train.csv"
     if train_path.exists():
-        df = pl.read_csv(train_path, columns=["TARGET"])
-        counts = df["TARGET"].value_counts().sort("TARGET")
+        df = spark.read.csv(str(train_path), header=True, inferSchema=True).select("TARGET")
+        total = df.count()
+        counts = df.groupBy("TARGET").count().orderBy("TARGET").collect()
         sections.append("## Target Distribution (application_train)")
         sections.append("")
-        for row in counts.iter_rows():
-            val, count = row
-            pct = count / df.shape[0] * 100
+        for row in counts:
+            val, count = row["TARGET"], row["count"]
+            pct = count / total * 100
             sections.append(f"- TARGET={val}: {count:,} ({pct:.1f}%)")
         sections.append("")
 

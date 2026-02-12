@@ -1,7 +1,7 @@
 """V3 optimization: enhanced cross-features + tuned LGB + CatBoost + 3-way blend."""
 
 import numpy as np
-import polars as pl
+import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from home_credit.features.pipeline import build_all_features, get_feature_columns
@@ -189,11 +189,11 @@ def main():
         + w_cb * cb_sub["TARGET"].to_numpy()
     )
 
-    submission = pl.DataFrame({
-        "SK_ID_CURR": test_df["SK_ID_CURR"],
+    submission = pd.DataFrame({
+        "SK_ID_CURR": test_df.select("SK_ID_CURR").toPandas()["SK_ID_CURR"],
         "TARGET": blended_preds,
     })
-    submission.write_csv(OUTPUT_DIR / "submission.csv")
+    submission.to_csv(OUTPUT_DIR / "submission.csv", index=False)
 
     n_features = len(xgb_pruned["feature_names"])
     message = (

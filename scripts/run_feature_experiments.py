@@ -9,7 +9,7 @@ Reports per-hypothesis AUC delta and feature importances.
 """
 
 import numpy as np
-import polars as pl
+from pyspark.sql import functions as F
 
 from home_credit.data.loader import load_table
 from home_credit.features.experimental import (
@@ -62,8 +62,8 @@ def main():
         prev = load_table("previous_application", DATA_DIR)
 
     # AMT_ANNUITY in bureau is String due to mixed values
-    bureau = bureau.with_columns(
-        pl.col("AMT_ANNUITY").cast(pl.String).cast(pl.Float64, strict=False)
+    bureau = bureau.withColumn(
+        "AMT_ANNUITY", F.col("AMT_ANNUITY").cast("string").cast("double")
     )
 
     with timer("Building experimental features", log):
@@ -71,11 +71,11 @@ def main():
             installments, cc, pos, bureau, bureau_balance, prev,
         )
 
-    log.info(f"Experimental features: {exp_feats.shape[1] - 1} new features")
+    log.info(f"Experimental features: {len(exp_feats.columns) - 1} new features")
 
     # Cache experimental features
     exp_path = FEATURES_DIR / "experimental.parquet"
-    exp_feats.write_parquet(exp_path)
+    exp_feats.write.mode("overwrite").parquet(str(exp_path))
     log.info(f"Cached experimental features to {exp_path}")
 
     # === 3. Join experimental features onto train ===

@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Home Credit Default Risk — Kaggle competition solution"
 requires-python = ">=3.11"
 dependencies = [
-    "polars>=1.0",
+    "pyspark>=3.5",
+    "pandas>=2.0",
     "scikit-learn>=1.5",
     "xgboost>=2.0",
     "shap>=0.45",

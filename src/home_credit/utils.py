@@ -1,16 +1,43 @@
 """Shared helpers: logging, timing, conversion utilities."""
 
 import logging
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-import polars as pl
+from pyspark.sql import DataFrame, SparkSession
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 FEATURES_DIR = DATA_DIR / "features"
+
+_spark_session = None
+
+
+def get_spark_session() -> SparkSession:
+    """Get or create a SparkSession. Configurable via environment variables."""
+    global _spark_session
+    if _spark_session is not None:
+        return _spark_session
+
+    master = os.environ.get("SPARK_MASTER", "local[*]")
+    app_name = os.environ.get("SPARK_APP_NAME", "home_credit")
+    driver_memory = os.environ.get("SPARK_DRIVER_MEMORY", "8g")
+
+    _spark_session = (
+        SparkSession.builder
+        .master(master)
+        .appName(app_name)
+        .config("spark.driver.memory", driver_memory)
+        .config("spark.sql.shuffle.partitions", "200")
+        .config("spark.sql.adaptive.enabled", "true")
+        .getOrCreate()
+    )
+    # Reduce Spark's verbose logging
+    _spark_session.sparkContext.setLogLevel("WARN")
+    return _spark_session
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -40,11 +67,11 @@ def ensure_dirs():
     FEATURES_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def to_pandas_for_model(df: pl.DataFrame) -> "pd.DataFrame":
-    """Convert Polars DataFrame to pandas, suitable for sklearn/xgboost."""
-    return df.to_pandas()
+def to_pandas_for_model(df: DataFrame) -> "pd.DataFrame":
+    """Convert Spark DataFrame to pandas, suitable for sklearn/xgboost."""
+    return df.toPandas()
 
 
-def to_numpy_for_model(df: pl.DataFrame) -> "np.ndarray":
-    """Convert Polars DataFrame to numpy array."""
-    return df.to_numpy()
+def to_numpy_for_model(df: DataFrame) -> "np.ndarray":
+    """Convert Spark DataFrame to numpy array."""
+    return df.toPandas().to_numpy()

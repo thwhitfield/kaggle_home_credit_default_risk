@@ -1,11 +1,12 @@
 """Tests for modeling modules."""
 
 import numpy as np
-import polars as pl
+import pandas as pd
 import pytest
 import xgboost as xgb
+from pyspark.sql import functions as F
 
-from home_credit.utils import FEATURES_DIR, OUTPUT_DIR
+from home_credit.utils import FEATURES_DIR, OUTPUT_DIR, get_spark_session
 
 
 @pytest.fixture(scope="module")
@@ -17,8 +18,9 @@ def check_features_exist():
 @pytest.fixture(scope="module")
 def small_train(check_features_exist):
     """Load a small sample for fast tests."""
-    df = pl.read_parquet(FEATURES_DIR / "train_final.parquet")
-    return df.sample(n=1000, seed=42)
+    spark = get_spark_session()
+    df = spark.read.parquet(str(FEATURES_DIR / "train_final.parquet"))
+    return df.orderBy(F.rand(seed=42)).limit(1000)
 
 
 class TestTraining:
@@ -63,9 +65,9 @@ class TestSubmission:
         if not sub_path.exists():
             pytest.skip("No submission file generated yet")
 
-        df = pl.read_csv(sub_path)
+        df = pd.read_csv(sub_path)
         assert list(df.columns) == ["SK_ID_CURR", "TARGET"]
-        assert df.shape[0] > 40_000
+        assert len(df) > 40_000
         assert df["TARGET"].min() >= 0
         assert df["TARGET"].max() <= 1
-        assert df["SK_ID_CURR"].n_unique() == df.shape[0], "Duplicate SK_ID_CURR"
+        assert df["SK_ID_CURR"].nunique() == len(df), "Duplicate SK_ID_CURR"

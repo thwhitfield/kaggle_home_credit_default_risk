@@ -6,7 +6,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import polars as pl
+import pandas as pd
 import seaborn as sns
 from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve
 
@@ -47,7 +47,7 @@ def threshold_analysis(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     save_dir: Path | None = None,
-) -> pl.DataFrame:
+) -> pd.DataFrame:
     """Analyze precision, recall, F1 at various probability cutoffs."""
     if save_dir is None:
         save_dir = OUTPUT_DIR
@@ -79,8 +79,8 @@ def threshold_analysis(
             "false_positives": int(fp),
         })
 
-    df = pl.DataFrame(rows)
-    df.write_csv(save_dir / "threshold_analysis.csv")
+    df = pd.DataFrame(rows)
+    df.to_csv(save_dir / "threshold_analysis.csv", index=False)
 
     # Plot
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))

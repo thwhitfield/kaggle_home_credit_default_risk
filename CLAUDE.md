@@ -6,8 +6,8 @@ Home Credit Default Risk — Kaggle competition. Predict loan default from appli
 
 ## Stack
 
-- **Data:** Polars (lazy evaluation, parquet caching)
-- **Modeling:** XGBoost (5-fold stratified CV)
+- **Data:** PySpark (local mode by default, distributed-ready)
+- **Modeling:** XGBoost (5-fold stratified CV), with LightGBM and CatBoost for blending
 - **Tuning:** Optuna
 - **Analysis:** SHAP, matplotlib/seaborn
 - **Deps:** managed with `uv`, src layout package `home_credit`
@@ -23,11 +23,18 @@ Home Credit Default Risk — Kaggle competition. Predict loan default from appli
 ```bash
 uv sync
 uv run python -m home_credit.data.download   # download data
-uv run python -m home_credit.features.pipeline  # build features (cached to parquet)
+uv run python -m home_credit.features.pipeline  # build features
 uv run python -m home_credit.modeling.train    # train baseline
 uv run python -m home_credit.modeling.submit -m "msg" --model best_model --submit
 uv run pytest tests/ -v
 ```
+
+## Spark Configuration
+
+PySpark runs in local mode by default (`local[*]`). Configure via environment variables:
+- `SPARK_MASTER` — Spark master URL (default: `local[*]`)
+- `SPARK_APP_NAME` — Application name (default: `home_credit`)
+- `SPARK_DRIVER_MEMORY` — Driver memory (default: `8g`)
 
 ## Key Files
 
@@ -37,13 +44,13 @@ uv run pytest tests/ -v
 - `scripts/run_experiments.py` — Full feature selection + tuning pipeline
 - `scripts/run_analysis.py` — SHAP + threshold analysis
 - `output/experiment_log.csv` — All experiment results
-- `data/features/` — Cached parquet feature sets
+- `data/features/` — Final parquet feature sets
 
 ## Architecture
 
-All supplementary tables are aggregated to `SK_ID_CURR` level. Features are built independently per table, then left-joined onto the application table. Feature sets are cached as parquet files in `data/features/`.
+All supplementary tables are aggregated to `SK_ID_CURR` level using PySpark. Features are built independently per table, then left-joined onto the application table. Final feature sets are written as parquet files to `data/features/`.
 
-Feature pipeline skips recomputation if parquet cache exists. To rebuild, delete `data/features/` and rerun.
+The feature pipeline always recomputes all features. At the modeling boundary, Spark DataFrames are converted to pandas/numpy for XGBoost training (since gradient boosting libraries require numpy arrays).
 
 ## Known Issues
 

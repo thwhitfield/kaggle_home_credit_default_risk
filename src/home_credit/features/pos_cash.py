@@ -1,13 +1,14 @@
 """Features from POS_CASH_balance table."""
 
-import polars as pl
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from home_credit.utils import get_logger
 
 log = get_logger(__name__)
 
 
-def build_pos_cash_features(pos: pl.DataFrame) -> pl.DataFrame:
+def build_pos_cash_features(pos: DataFrame) -> DataFrame:
     """Aggregate POS/cash balance features to SK_ID_CURR level.
 
     POS_CASH tracks monthly snapshots of point-of-sale and cash loans.
@@ -16,63 +17,56 @@ def build_pos_cash_features(pos: pl.DataFrame) -> pl.DataFrame:
     log.info("Building POS/cash features")
 
     # --- Main aggregation ---
-    feats = pos.group_by("SK_ID_CURR").agg(
+    feats = pos.groupBy("SK_ID_CURR").agg(
         # --- Volume ---
-        pl.len().alias("POS_COUNT"),
-        pl.col("SK_ID_PREV").n_unique().alias("POS_NUM_LOANS"),
-        # --- DPD (days past due) ---
-        pl.col("SK_DPD").mean().alias("POS_DPD_MEAN"),
-        pl.col("SK_DPD").max().alias("POS_DPD_MAX"),
-        pl.col("SK_DPD").sum().alias("POS_DPD_SUM"),
-        (pl.col("SK_DPD") > 0).sum().alias("POS_DPD_MONTHS_COUNT"),
-        # DPD_DEF (days past due — tolerance threshold)
-        pl.col("SK_DPD_DEF").mean().alias("POS_DPD_DEF_MEAN"),
-        pl.col("SK_DPD_DEF").max().alias("POS_DPD_DEF_MAX"),
-        (pl.col("SK_DPD_DEF") > 0).sum().alias("POS_DPD_DEF_COUNT"),
+        F.count("*").alias("POS_COUNT"),
+        F.countDistinct("SK_ID_PREV").alias("POS_NUM_LOANS"),
+        # --- DPD ---
+        F.avg("SK_DPD").alias("POS_DPD_MEAN"),
+        F.max("SK_DPD").alias("POS_DPD_MAX"),
+        F.sum("SK_DPD").alias("POS_DPD_SUM"),
+        F.sum(F.when(F.col("SK_DPD") > 0, 1).otherwise(0)).alias("POS_DPD_MONTHS_COUNT"),
+        # DPD_DEF
+        F.avg("SK_DPD_DEF").alias("POS_DPD_DEF_MEAN"),
+        F.max("SK_DPD_DEF").alias("POS_DPD_DEF_MAX"),
+        F.sum(F.when(F.col("SK_DPD_DEF") > 0, 1).otherwise(0)).alias("POS_DPD_DEF_COUNT"),
         # --- Contract status ---
-        (pl.col("NAME_CONTRACT_STATUS") == "Active").sum().alias("POS_ACTIVE_MONTHS"),
-        (pl.col("NAME_CONTRACT_STATUS") == "Completed").sum().alias("POS_COMPLETED_MONTHS"),
-        (pl.col("NAME_CONTRACT_STATUS") == "Signed").sum().alias("POS_SIGNED_MONTHS"),
+        F.sum(F.when(F.col("NAME_CONTRACT_STATUS") == "Active", 1).otherwise(0)).alias("POS_ACTIVE_MONTHS"),
+        F.sum(F.when(F.col("NAME_CONTRACT_STATUS") == "Completed", 1).otherwise(0)).alias("POS_COMPLETED_MONTHS"),
+        F.sum(F.when(F.col("NAME_CONTRACT_STATUS") == "Signed", 1).otherwise(0)).alias("POS_SIGNED_MONTHS"),
         # --- Remaining installments ---
-        pl.col("CNT_INSTALMENT").max().alias("POS_MAX_INSTALMENTS"),
-        pl.col("CNT_INSTALMENT_FUTURE").mean().alias("POS_REMAINING_INSTALMENTS_MEAN"),
-        pl.col("CNT_INSTALMENT_FUTURE").max().alias("POS_REMAINING_INSTALMENTS_MAX"),
+        F.max("CNT_INSTALMENT").alias("POS_MAX_INSTALMENTS"),
+        F.avg("CNT_INSTALMENT_FUTURE").alias("POS_REMAINING_INSTALMENTS_MEAN"),
+        F.max("CNT_INSTALMENT_FUTURE").alias("POS_REMAINING_INSTALMENTS_MAX"),
         # --- Time depth ---
-        pl.col("MONTHS_BALANCE").min().alias("POS_MONTHS_BALANCE_MIN"),
+        F.min("MONTHS_BALANCE").alias("POS_MONTHS_BALANCE_MIN"),
     )
 
     # --- Recent POS behavior (last 6 months) ---
-    recent_6m = pos.filter(pl.col("MONTHS_BALANCE") >= -6).group_by("SK_ID_CURR").agg(
-        pl.col("SK_DPD").max().alias("POS_RECENT_6M_DPD_MAX"),
-        pl.col("SK_DPD").mean().alias("POS_RECENT_6M_DPD_MEAN"),
-        (pl.col("SK_DPD") > 0).sum().alias("POS_RECENT_6M_DPD_COUNT"),
-        (pl.col("NAME_CONTRACT_STATUS") == "Active").sum().alias("POS_RECENT_6M_ACTIVE"),
+    recent_6m = pos.filter(F.col("MONTHS_BALANCE") >= -6).groupBy("SK_ID_CURR").agg(
+        F.max("SK_DPD").alias("POS_RECENT_6M_DPD_MAX"),
+        F.avg("SK_DPD").alias("POS_RECENT_6M_DPD_MEAN"),
+        F.sum(F.when(F.col("SK_DPD") > 0, 1).otherwise(0)).alias("POS_RECENT_6M_DPD_COUNT"),
+        F.sum(F.when(F.col("NAME_CONTRACT_STATUS") == "Active", 1).otherwise(0)).alias("POS_RECENT_6M_ACTIVE"),
     )
 
     # --- Recent POS behavior (last 12 months) ---
-    recent_12m = pos.filter(pl.col("MONTHS_BALANCE") >= -12).group_by("SK_ID_CURR").agg(
-        pl.col("SK_DPD").max().alias("POS_RECENT_12M_DPD_MAX"),
-        (pl.col("SK_DPD") > 0).sum().alias("POS_RECENT_12M_DPD_COUNT"),
-        (pl.col("SK_DPD_DEF") > 0).sum().alias("POS_RECENT_12M_DPD_DEF_COUNT"),
+    recent_12m = pos.filter(F.col("MONTHS_BALANCE") >= -12).groupBy("SK_ID_CURR").agg(
+        F.max("SK_DPD").alias("POS_RECENT_12M_DPD_MAX"),
+        F.sum(F.when(F.col("SK_DPD") > 0, 1).otherwise(0)).alias("POS_RECENT_12M_DPD_COUNT"),
+        F.sum(F.when(F.col("SK_DPD_DEF") > 0, 1).otherwise(0)).alias("POS_RECENT_12M_DPD_DEF_COUNT"),
     )
 
-    feats = feats.join(recent_6m, on="SK_ID_CURR", how="left")
-    feats = feats.join(recent_12m, on="SK_ID_CURR", how="left")
+    feats = feats.join(recent_6m, "SK_ID_CURR", "left")
+    feats = feats.join(recent_12m, "SK_ID_CURR", "left")
 
     # Derived
-    feats = feats.with_columns(
-        # DPD rate across all POS months
-        (pl.col("POS_DPD_MONTHS_COUNT") / (pl.col("POS_COUNT") + 1))
-        .alias("POS_DPD_RATE"),
-        # Completion rate
-        (pl.col("POS_COMPLETED_MONTHS") / (pl.col("POS_COUNT") + 1))
-        .alias("POS_COMPLETION_RATE"),
-        # Average months per loan
-        (pl.col("POS_COUNT") / (pl.col("POS_NUM_LOANS") + 1))
-        .alias("POS_AVG_MONTHS_PER_LOAN"),
-        # Recent DPD rate
-        (pl.col("POS_RECENT_6M_DPD_COUNT").fill_null(0) / 6.0)
-        .alias("POS_RECENT_6M_DPD_RATE"),
+    feats = feats.select(
+        "*",
+        (F.col("POS_DPD_MONTHS_COUNT") / (F.col("POS_COUNT") + 1)).alias("POS_DPD_RATE"),
+        (F.col("POS_COMPLETED_MONTHS") / (F.col("POS_COUNT") + 1)).alias("POS_COMPLETION_RATE"),
+        (F.col("POS_COUNT") / (F.col("POS_NUM_LOANS") + 1)).alias("POS_AVG_MONTHS_PER_LOAN"),
+        (F.coalesce(F.col("POS_RECENT_6M_DPD_COUNT"), F.lit(0)) / 6.0).alias("POS_RECENT_6M_DPD_RATE"),
     )
 
     return feats
